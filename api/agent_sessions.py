@@ -202,6 +202,33 @@ def _optional_col(name: str, columns: set[str], fallback: str = "NULL") -> str:
     return f"s.{name}" if name in columns else f"{fallback} AS {name}"
 
 
+def _model_provider_from_agent_row(row: dict) -> str | None:
+    """Return the provider a state.db session was created on.
+
+    ``sessions.model`` is a bare id that can exist on more than one provider.
+    ``model_config.provider`` is the session's selected provider. ``billing_provider``
+    is the standing billing identity on the session row, not a per-call fallback.
+    Prefer the selected provider. Fall back to billing identity only when config
+    has none. An empty result means the row never recorded a provider.
+    """
+    raw = row.get("model_config")
+    if isinstance(raw, (bytes, bytearray)):
+        raw = raw.decode("utf-8", "replace")
+    if isinstance(raw, str) and raw.strip():
+        try:
+            raw = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            raw = None
+    if isinstance(raw, dict):
+        provider = str(raw.get("provider") or "").strip().lower()
+        if provider and provider != "default":
+            return provider
+    billing = str(row.get("billing_provider") or "").strip().lower()
+    if billing and billing != "default":
+        return billing
+    return None
+
+
 def _safe_lower(value) -> str:
     return str(value or "").strip().lower()
 
@@ -650,6 +677,9 @@ def _project_agent_session_rows(rows: list[dict]) -> list[dict]:
         for key in (
             'id', 'model', 'message_count', 'actual_message_count', 'actual_user_message_count',
             'ended_at', 'end_reason', 'last_activity', 'archived',
+            # The tip's model is copied above. Its provider has to travel with
+            # that model, or a compressed Desktop session imports as a bare id.
+            'model_config', 'billing_provider',
         ):
             if key in tip:
                 merged[key] = tip[key]
@@ -808,6 +838,7 @@ def read_importable_agent_session_rows(
         platform_expr = _optional_col('platform', session_cols)
         archived_expr = _optional_col('archived', session_cols)
         project_id_expr = _optional_col('project_id', session_cols)
+        billing_provider_expr = _optional_col('billing_provider', session_cols)
         # Older/minimal state.db schemas can have NO ``messages`` table at all,
         # or a ``messages`` table without a ``session_id`` / ``timestamp`` column.
         # The projection SQL below joins ``messages`` and aggregates
@@ -1004,6 +1035,7 @@ def read_importable_agent_session_rows(
                    {ended_expr},
                    {end_reason_expr},
                    {archived_expr},
+                   {billing_provider_expr},
                    {actual_count_expr} AS actual_message_count,
                    {user_message_count_expr} AS actual_user_message_count,
                    {last_activity_expr} AS last_activity
@@ -1011,11 +1043,19 @@ def read_importable_agent_session_rows(
 
         def _project(raw_rows: list[dict]) -> list[dict]:
             projected = _project_agent_session_rows(raw_rows)
-            # model_config is selected only so the continuation classifier can
-            # read the real _branched_from/_delegate_from markers; it is internal
+            # model_config is selected so the continuation classifier can read
+            # the real _branched_from/_delegate_from markers, and so import can
+            # recover the session's selected provider. The raw blob is internal
             # agent state and must not leak into the /api/sessions response.
+            # Publish only the provider id. A bare model id is not enough: the
+            # same id can exist on the profile provider and on the provider the
+            # Desktop/CLI session was created on (#8249).
             for row in projected:
+                provider = _model_provider_from_agent_row(row)
+                if provider:
+                    row['model_provider'] = provider
                 row.pop('model_config', None)
+                row.pop('billing_provider', None)
             projected = [_with_normalized_source(row) for row in projected]
             return [row for row in projected if is_cli_session_row_visible(row)]
 

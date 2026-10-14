@@ -5961,6 +5961,7 @@ def _get_or_materialize_session(sid: str, *, refresh_cli_messages: bool = False)
             title=cli_meta.get("title") or title_from(get_cli_session_messages(sid), "CLI Session"),
             workspace=get_last_workspace(),
             model=cli_meta.get("model") or "unknown",
+            model_provider=cli_meta.get("model_provider"),
             created_at=cli_meta.get("created_at"),
             updated_at=cli_meta.get("updated_at"),
         )
@@ -5979,6 +5980,7 @@ def _get_or_materialize_session(sid: str, *, refresh_cli_messages: bool = False)
             profile=cli_meta.get("profile"),
             created_at=cli_meta.get("created_at"),
             updated_at=cli_meta.get("updated_at"),
+            model_provider=cli_meta.get("model_provider"),
         )
         _apply_source_meta(s)
 
@@ -7182,7 +7184,7 @@ def _normalize_provider_id(value: str | None) -> str:
             return normalized
     # Unknown prefix — return empty so callers treat it as "no match" and pass
     # the model through unchanged rather than incorrectly stripping it.
-    return "" 
+    return ""
 
 
 def _catalog_provider_id_sets(catalog: dict) -> tuple[set[str], set[str]]:
@@ -18531,6 +18533,7 @@ def handle_post(handler, parsed) -> bool:
                     workspace=get_last_workspace(profile=_arch_profile),
                     messages=[],
                     model=cli_meta.get("model") or "unknown",
+                    model_provider=cli_meta.get("model_provider"),
                     created_at=cli_meta.get("created_at"),
                     updated_at=cli_meta.get("updated_at"),
                     profile=_arch_profile,
@@ -18559,6 +18562,7 @@ def handle_post(handler, parsed) -> bool:
                     profile=cli_meta.get("profile"),
                     created_at=cli_meta.get("created_at"),
                     updated_at=cli_meta.get("updated_at"),
+                    model_provider=cli_meta.get("model_provider"),
                 )
                 s.is_cli_session = is_cli_session_row(cli_meta)
                 s.source_tag = cli_meta.get("source_tag")
@@ -23210,7 +23214,7 @@ def _handle_live_models(handler, parsed):
                         custom_provider_entry = _cp
                     _config_ids.extend(_custom_provider_model_ids(_cp))
                     _allowlist_ids.extend(_custom_provider_allowlist_ids(_cp))
-            
+
             # Always try live fetch for custom providers — config entries are a
             # fallback, not a replacement.  The live endpoint should return ALL
             # models the key has access to, not just what's listed in config.yaml.
@@ -23246,7 +23250,7 @@ def _handle_live_models(handler, parsed):
                     try:
                         import urllib.request
                         import json
-                        
+
                         # Build the models endpoint URL
                         # AxonHub and similar OpenAI-compat endpoints serve /v1/models
                         _ep = _base_url.rstrip("/")
@@ -23255,15 +23259,15 @@ def _handle_live_models(handler, parsed):
                             _models_url = f"{_ep}/models"
                         else:
                             _models_url = f"{_ep}/v1/models"
-                        
+
                         _req = urllib.request.Request(
                             _models_url,
                             headers={"Authorization": f"Bearer {_api_key}"},
                         )
-                        
+
                         with urllib.request.urlopen(_req, timeout=CUSTOM_MODELS_ENDPOINT_TIMEOUT_SECONDS) as _resp:
                             _body = json.loads(_resp.read())
-                        
+
                         # Parse response: {"data": [{"id": "model1", ...}, ...]}
                         if isinstance(_body, dict):
                             _data = _body.get("data", [])
@@ -31221,6 +31225,11 @@ def _handle_session_import_cli(handler, body):
                 "source_label": existing.source_label or cli_meta.get("source_label"),
                 "parent_session_id": existing.parent_session_id or cli_meta.get("parent_session_id"),
             }
+            incoming_provider = _clean_session_model_provider(cli_meta.get("model_provider"))
+            # Only fill a missing provider. A later WebUI pick must win over
+            # the state.db identity on re-import (#8249).
+            if incoming_provider and not _clean_session_model_provider(getattr(existing, "model_provider", None)):
+                updates["model_provider"] = incoming_provider
             # A subagent child is view-only: also coerce read_only=True on the
             # persisted sidecar so a stale writable (pre-fix) sidecar can't be
             # used to start a WebUI turn (#5307).
@@ -31359,6 +31368,7 @@ def _handle_session_import_cli(handler, body):
         created_at=created_at,
         updated_at=updated_at,
         parent_session_id=cli_parent_session_id,
+        model_provider=(cli_meta or {}).get("model_provider"),
     )
     if cron_project_id:
         s.project_id = cron_project_id
