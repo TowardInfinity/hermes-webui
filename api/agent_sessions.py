@@ -229,6 +229,75 @@ def _model_provider_from_agent_row(row: dict) -> str | None:
     return None
 
 
+def model_provider_backfill(existing_model, existing_provider, incoming_model, incoming_provider) -> str | None:
+    """Provider to write onto a sidecar that has none, or None to leave it.
+
+    A session imported before the provider was preserved can have an empty
+    ``model_provider``. Re-import may fill that only when the stored model
+    still matches the imported model. A later model change must not inherit
+    the old Desktop provider.
+    """
+    incoming = str(incoming_provider or "").strip().lower()
+    if not incoming or incoming == "default":
+        return None
+    existing = str(existing_provider or "").strip().lower()
+    if existing and existing != "default":
+        return None
+    stored = str(existing_model or "").strip().lower()
+    imported = str(incoming_model or "").strip().lower()
+    if stored in ("", "unknown") or imported in ("", "unknown"):
+        return incoming
+    if stored != imported:
+        return None
+    return incoming
+
+
+_CLAIM_ROW_COLUMNS = (
+    "source",
+    "title",
+    "model",
+    "cwd",
+    "started_at",
+    "ended_at",
+    "model_config",
+    "billing_provider",
+)
+
+
+def read_state_db_claim_row(db_path, sid: str) -> dict | None:
+    """Read one state.db session for the saved-link claim path.
+
+    The recent-session list is capped, so an older Desktop/CLI session opened
+    by id never reaches that projection. This read must still carry the
+    provider. Columns that an older state.db lacks are omitted rather than
+    failing the whole lookup.
+    """
+    if not db_path or not sid:
+        return None
+    path = Path(db_path)
+    if not path.exists():
+        return None
+    with closing(sqlite3.connect(str(path))) as conn:
+        conn.row_factory = sqlite3.Row
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(sessions)").fetchall()}
+        selected = [name for name in _CLAIM_ROW_COLUMNS if name in columns]
+        if "id" not in columns or "source" not in selected:
+            return None
+        row = conn.execute(
+            f"SELECT {', '.join(selected)} FROM sessions WHERE id = ?",
+            (sid,),
+        ).fetchone()
+        if row is None:
+            return None
+        data = dict(row)
+    provider = _model_provider_from_agent_row(data)
+    data.pop("model_config", None)
+    data.pop("billing_provider", None)
+    if provider:
+        data["model_provider"] = provider
+    return data
+
+
 def _safe_lower(value) -> str:
     return str(value or "").strip().lower()
 

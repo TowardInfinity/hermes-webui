@@ -9642,16 +9642,10 @@ def _claim_or_synthesize_cli_session(sid: str, cli_meta: dict = None):
         from api.models import _active_state_db_path
         db_path = _active_state_db_path()
         if db_path and Path(db_path).exists():
-            import sqlite3 as _sqlite
-            with closing(_sqlite.connect(str(db_path))) as _conn:
-                _conn.row_factory = _sqlite.Row
-                _row = _conn.execute(
-                    "SELECT source, title, model, cwd, started_at, ended_at "
-                    "FROM sessions WHERE id = ?", (sid,)
-                ).fetchone()
-                if _row is not None:
-                    state_db_row = dict(_row)
-                    state_db_source = str(_row["source"] or "").strip().lower()
+            from api.agent_sessions import read_state_db_claim_row
+            state_db_row = read_state_db_claim_row(db_path, sid)
+            if state_db_row is not None:
+                state_db_source = str(state_db_row.get("source") or "").strip().lower()
     except Exception:
         state_db_source = ""
     # Populate source metadata from state.db when cli_meta is empty so the
@@ -9674,6 +9668,8 @@ def _claim_or_synthesize_cli_session(sid: str, cli_meta: dict = None):
             cli_meta["title"] = state_db_row["title"]
         if not cli_meta.get("model") and state_db_row.get("model"):
             cli_meta["model"] = state_db_row["model"]
+        if not cli_meta.get("model_provider") and state_db_row.get("model_provider"):
+            cli_meta["model_provider"] = state_db_row["model_provider"]
         if not cli_meta.get("workspace") and state_db_row.get("cwd"):
             cli_meta["workspace"] = state_db_row["cwd"]
         # Map state.db timestamps to created_at/updated_at on the
@@ -32206,11 +32202,18 @@ def _handle_session_import_cli(handler, body):
                 "source_label": existing.source_label or cli_meta.get("source_label"),
                 "parent_session_id": existing.parent_session_id or cli_meta.get("parent_session_id"),
             }
-            incoming_provider = _clean_session_model_provider(cli_meta.get("model_provider"))
-            # Only fill a missing provider. A later WebUI pick must win over
-            # the state.db identity on re-import (#8249).
-            if incoming_provider and not _clean_session_model_provider(getattr(existing, "model_provider", None)):
-                updates["model_provider"] = incoming_provider
+            from api.agent_sessions import model_provider_backfill
+            # Only fill a missing provider, and only when the stored model
+            # still matches. A later WebUI model change must not inherit the
+            # old Desktop provider (#8249).
+            filled_provider = model_provider_backfill(
+                getattr(existing, "model", None),
+                _clean_session_model_provider(getattr(existing, "model_provider", None)),
+                cli_meta.get("model"),
+                _clean_session_model_provider(cli_meta.get("model_provider")),
+            )
+            if filled_provider:
+                updates["model_provider"] = filled_provider
             # A subagent child is view-only: also coerce read_only=True on the
             # persisted sidecar so a stale writable (pre-fix) sidecar can't be
             # used to start a WebUI turn (#5307).
