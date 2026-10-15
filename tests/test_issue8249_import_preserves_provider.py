@@ -131,7 +131,7 @@ def test_reimport_backfill_skips_a_changed_model():
     assert model_provider_backfill("deepseek-v4.1-flash", None, "grok-4.7", "xai-oauth") is None
     assert model_provider_backfill("grok-4.7", "opencode-go", "grok-4.7", "xai-oauth") is None
     assert model_provider_backfill("unknown", None, "grok-4.7", "xai-oauth") == "xai-oauth"
-    assert model_provider_backfill("grok-4.7", None, "grok-4.7", "custom") is None
+    assert model_provider_backfill("grok-4.7", None, "grok-4.7", "custom") == "custom"
     assert model_provider_backfill("grok-4.7", None, "grok-4.7", "auto") is None
 
 
@@ -184,6 +184,7 @@ def test_bare_billing_buckets_are_not_imported_as_providers(tmp_path):
 
     assert _model_provider_from_agent_row({"billing_provider": "custom"}) is None
     assert _model_provider_from_agent_row({"billing_provider": "auto"}) is None
+    assert _model_provider_from_agent_row({"model_config": json.dumps({"provider": "custom"})}) == "custom"
     assert _model_provider_from_agent_row({"billing_provider": "xai-oauth"}) == "xai-oauth"
     assert _model_provider_from_agent_row({
         "model_config": json.dumps({"provider": "custom:my-relay"}),

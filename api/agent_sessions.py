@@ -242,7 +242,10 @@ def model_provider_backfill(existing_model, existing_provider, incoming_model, i
     the old Desktop provider.
     """
     incoming = str(incoming_provider or "").strip().lower()
-    if not incoming or incoming in {"auto", "custom", "default"}:
+    # `auto` and `default` are never a route. `custom` is rejected only on the
+    # billing fallback above. An explicit model_config.provider of `custom`
+    # must still backfill, or re-import drops that route.
+    if not incoming or incoming in {"auto", "default"}:
         return None
     existing = str(existing_provider or "").strip().lower()
     if existing and existing != "default":
