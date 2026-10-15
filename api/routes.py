@@ -32189,67 +32189,73 @@ def _handle_session_import_cli(handler, body):
             sid,
             profile=(cli_meta or {}).get("profile") or refresh_profile,
         )
-        changed = False
-        if fresh_msgs and len(fresh_msgs) > len(existing.messages):
-            # Prefix-equality guard: only extend if existing messages are a prefix of
-            # the fresh CLI messages. Prevents silently dropping WebUI-added messages
-            # on hybrid sessions (user sent messages via WebUI while CLI continued).
-            if _is_messages_refresh_prefix_match(existing.messages, fresh_msgs):
-                existing.messages = fresh_msgs
-                changed = True
-        elif fresh_msgs and _is_cli_tool_metadata_enrichment(existing.messages, fresh_msgs):
-            # Same row count, richer payload: rebuild sidecars imported before
-            # CLI tool metadata was preserved (#1772).
-            existing.messages = fresh_msgs
-            changed = True
-        if cli_meta:
-            # A subagent child must never be flipped to CLI-classified /
-            # writable on an existing-session refresh either (#5307).
-            _existing_is_sa = (
-                (existing.source_tag or existing.raw_source or "").strip().lower() == "subagent"
-                or (cli_meta.get("source_tag") or cli_meta.get("raw_source") or "").strip().lower() == "subagent"
-                or _is_subagent_child_session_id(sid)
-            )
-            updates = {
-                "is_cli_session": (False if _existing_is_sa else True),
-                "source_tag": existing.source_tag or cli_meta.get("source_tag"),
-                "raw_source": existing.raw_source or cli_meta.get("raw_source") or cli_meta.get("source_tag"),
-                "session_source": existing.session_source or cli_meta.get("session_source"),
-                "source_label": existing.source_label or cli_meta.get("source_label"),
-                "parent_session_id": existing.parent_session_id or cli_meta.get("parent_session_id"),
-            }
-            from api.agent_sessions import model_provider_backfill
-            # Only fill a missing provider, and only when the stored model
-            # still matches. A later WebUI model change must not inherit the
-            # old Desktop provider (#8249).
-            filled_provider = model_provider_backfill(
-                getattr(existing, "model", None),
-                _clean_session_model_provider(getattr(existing, "model_provider", None)),
-                cli_meta.get("model"),
-                _clean_session_model_provider(cli_meta.get("model_provider")),
-            )
-            if filled_provider:
-                updates["model_provider"] = filled_provider
-            # A subagent child is view-only: also coerce read_only=True on the
-            # persisted sidecar so a stale writable (pre-fix) sidecar can't be
-            # used to start a WebUI turn (#5307).
-            if _existing_is_sa:
-                updates["read_only"] = True
-            for attr, value in updates.items():
-                if getattr(existing, attr, None) != value:
-                    setattr(existing, attr, value)
+        # Reload under the session lock before repair. The pre-lock load is
+        # stale if a model pick lands in between, and saving that object
+        # writes the old model/provider pair back over the pick.
+        with _get_session_agent_lock(sid):
+            current = Session.load(sid) or existing
+            changed = False
+            if fresh_msgs and len(fresh_msgs) > len(current.messages):
+                # Prefix-equality guard: only extend if existing messages are a prefix of
+                # the fresh CLI messages. Prevents silently dropping WebUI-added messages
+                # on hybrid sessions (user sent messages via WebUI while CLI continued).
+                if _is_messages_refresh_prefix_match(current.messages, fresh_msgs):
+                    current.messages = fresh_msgs
                     changed = True
-        else:
-            _existing_is_sa = (
-                (existing.source_tag or existing.raw_source or "").strip().lower() == "subagent"
-                or _is_subagent_child_session_id(sid)
-            )
-        if changed:
-            existing.save(touch_updated_at=False)
-            publish_session_list_changed(
-                "session_import_cli",
-                profile=getattr(existing, "profile", None),
-            )
+            elif fresh_msgs and _is_cli_tool_metadata_enrichment(current.messages, fresh_msgs):
+                # Same row count, richer payload: rebuild sidecars imported before
+                # CLI tool metadata was preserved (#1772).
+                current.messages = fresh_msgs
+                changed = True
+            if cli_meta:
+                # A subagent child must never be flipped to CLI-classified /
+                # writable on an existing-session refresh either (#5307).
+                _existing_is_sa = (
+                    (current.source_tag or current.raw_source or "").strip().lower() == "subagent"
+                    or (cli_meta.get("source_tag") or cli_meta.get("raw_source") or "").strip().lower() == "subagent"
+                    or _is_subagent_child_session_id(sid)
+                )
+                updates = {
+                    "is_cli_session": (False if _existing_is_sa else True),
+                    "source_tag": current.source_tag or cli_meta.get("source_tag"),
+                    "raw_source": current.raw_source or cli_meta.get("raw_source") or cli_meta.get("source_tag"),
+                    "session_source": current.session_source or cli_meta.get("session_source"),
+                    "source_label": current.source_label or cli_meta.get("source_label"),
+                    "parent_session_id": current.parent_session_id or cli_meta.get("parent_session_id"),
+                }
+                from api.agent_sessions import model_provider_backfill
+                # Only fill a missing provider, and only when the stored model
+                # still matches. A later WebUI model change must not inherit the
+                # old Desktop provider (#8249). Recomputed on the locked load.
+                filled_provider = model_provider_backfill(
+                    getattr(current, "model", None),
+                    _clean_session_model_provider(getattr(current, "model_provider", None)),
+                    cli_meta.get("model"),
+                    _clean_session_model_provider(cli_meta.get("model_provider")),
+                )
+                if filled_provider:
+                    updates["model_provider"] = filled_provider
+                # A subagent child is view-only: also coerce read_only=True on the
+                # persisted sidecar so a stale writable (pre-fix) sidecar can't be
+                # used to start a WebUI turn (#5307).
+                if _existing_is_sa:
+                    updates["read_only"] = True
+                for attr, value in updates.items():
+                    if getattr(current, attr, None) != value:
+                        setattr(current, attr, value)
+                        changed = True
+            else:
+                _existing_is_sa = (
+                    (current.source_tag or current.raw_source or "").strip().lower() == "subagent"
+                    or _is_subagent_child_session_id(sid)
+                )
+            if changed:
+                current.save(touch_updated_at=False)
+                publish_session_list_changed(
+                    "session_import_cli",
+                    profile=getattr(current, "profile", None),
+                )
+            existing = current
         return j(
             handler,
             {

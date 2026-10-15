@@ -131,6 +131,8 @@ def test_reimport_backfill_skips_a_changed_model():
     assert model_provider_backfill("deepseek-v4.1-flash", None, "grok-4.7", "xai-oauth") is None
     assert model_provider_backfill("grok-4.7", "opencode-go", "grok-4.7", "xai-oauth") is None
     assert model_provider_backfill("unknown", None, "grok-4.7", "xai-oauth") == "xai-oauth"
+    assert model_provider_backfill("grok-4.7", None, "grok-4.7", "custom") is None
+    assert model_provider_backfill("grok-4.7", None, "grok-4.7", "auto") is None
 
 
 def test_claim_row_reads_provider_without_the_recent_list(tmp_path):
@@ -175,6 +177,41 @@ def test_claim_row_reads_provider_without_the_recent_list(tmp_path):
     assert row["model_provider"] == "xai-oauth"
     assert "model_config" not in row
     assert "billing_provider" not in row
+
+
+def test_bare_billing_buckets_are_not_imported_as_providers(tmp_path):
+    from api.agent_sessions import _model_provider_from_agent_row, read_state_db_claim_row
+
+    assert _model_provider_from_agent_row({"billing_provider": "custom"}) is None
+    assert _model_provider_from_agent_row({"billing_provider": "auto"}) is None
+    assert _model_provider_from_agent_row({"billing_provider": "xai-oauth"}) == "xai-oauth"
+    assert _model_provider_from_agent_row({
+        "model_config": json.dumps({"provider": "custom:my-relay"}),
+        "billing_provider": "custom",
+    }) == "custom:my-relay"
+
+    db = tmp_path / "state.db"
+    conn = sqlite3.connect(str(db))
+    conn.execute(
+        """
+        CREATE TABLE sessions (
+            id TEXT PRIMARY KEY,
+            source TEXT,
+            title TEXT,
+            model TEXT,
+            billing_provider TEXT
+        )
+        """
+    )
+    conn.execute(
+        "INSERT INTO sessions VALUES (?, ?, ?, ?, ?)",
+        ("bucket", "cli", "Bucket", "grok-4.7", "custom"),
+    )
+    conn.commit()
+    conn.close()
+    row = read_state_db_claim_row(db, "bucket")
+    assert row["model"] == "grok-4.7"
+    assert "model_provider" not in row
 
 
 def test_claim_row_survives_a_db_without_provider_columns(tmp_path):

@@ -224,7 +224,11 @@ def _model_provider_from_agent_row(row: dict) -> str | None:
         if provider and provider != "default":
             return provider
     billing = str(row.get("billing_provider") or "").strip().lower()
-    if billing and billing != "default":
+    # `auto` and `custom` are billing buckets, not provider identities. The
+    # Agent leaves those unset and uses the profile provider
+    # (hermes_state._BARE_BILLING_PROVIDERS). Pinning the bare bucket drops
+    # a named custom endpoint such as custom:my-relay.
+    if billing and billing not in {"auto", "custom", "default"}:
         return billing
     return None
 
@@ -238,7 +242,7 @@ def model_provider_backfill(existing_model, existing_provider, incoming_model, i
     the old Desktop provider.
     """
     incoming = str(incoming_provider or "").strip().lower()
-    if not incoming or incoming == "default":
+    if not incoming or incoming in {"auto", "custom", "default"}:
         return None
     existing = str(existing_provider or "").strip().lower()
     if existing and existing != "default":
@@ -277,7 +281,7 @@ def read_state_db_claim_row(db_path, sid: str) -> dict | None:
     path = Path(db_path)
     if not path.exists():
         return None
-    with closing(sqlite3.connect(str(path))) as conn:
+    with closing(open_state_db_readonly(path)) as conn:
         conn.row_factory = sqlite3.Row
         columns = {row[1] for row in conn.execute("PRAGMA table_info(sessions)").fetchall()}
         selected = [name for name in _CLAIM_ROW_COLUMNS if name in columns]
