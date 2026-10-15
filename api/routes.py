@@ -32257,6 +32257,22 @@ def _handle_session_import_cli(handler, body):
                     "session_import_cli",
                     profile=getattr(current, "profile", None),
                 )
+            # Session.load returns a new object. An already-open session stays
+            # in SESSIONS, and a later draft save of that object would wipe a
+            # disk-only repair. Copy the provider onto the resident object.
+            from api.agent_sessions import model_provider_backfill
+            from api.config import LOCK, SESSIONS
+            with LOCK:
+                resident = SESSIONS.get(sid)
+            if resident is not None and resident is not current:
+                resident_provider = model_provider_backfill(
+                    getattr(resident, "model", None),
+                    _clean_session_model_provider(getattr(resident, "model_provider", None)),
+                    cli_meta.get("model") if cli_meta else getattr(current, "model", None),
+                    getattr(current, "model_provider", None),
+                )
+                if resident_provider:
+                    resident.model_provider = resident_provider
             existing = current
         return j(
             handler,

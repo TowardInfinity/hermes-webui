@@ -197,6 +197,12 @@ def test_bare_billing_buckets_are_not_imported_as_providers(tmp_path):
         }),
         "billing_provider": "custom",
     }) == "opencode-go"
+    assert _model_provider_from_agent_row({
+        "model_config": json.dumps({"gateway_runtime": {"provider": "custom", "base_url": "http://relay"}}),
+    }) is None
+    assert _model_provider_from_agent_row({
+        "model_config": json.dumps({"gateway_runtime": {"provider": "custom:my-relay"}}),
+    }) == "custom:my-relay"
 
     db = tmp_path / "state.db"
     conn = sqlite3.connect(str(db))

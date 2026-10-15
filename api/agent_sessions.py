@@ -223,9 +223,9 @@ def _model_provider_from_agent_row(row: dict) -> str | None:
         runtime = raw.get("gateway_runtime")
         if isinstance(runtime, dict):
             runtime_provider = str(runtime.get("provider") or "").strip().lower()
-            # Newest route. The Agent resume path prefers this over the older
-            # top-level provider and the billing fallback.
-            if runtime_provider and runtime_provider != "default":
+            # Newest route, unless it is only a billing bucket. A bare
+            # `custom` here is not an endpoint. A named `custom:my-relay` is.
+            if runtime_provider and runtime_provider not in {"auto", "custom", "default"}:
                 return runtime_provider
         provider = str(raw.get("provider") or "").strip().lower()
         if provider and provider != "default":
