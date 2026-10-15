@@ -32193,7 +32193,9 @@ def _handle_session_import_cli(handler, body):
         # stale if a model pick lands in between, and saving that object
         # writes the old model/provider pair back over the pick.
         with _get_session_agent_lock(sid):
-            current = Session.load(sid) or existing
+            current = Session.load(sid)
+            if current is None:
+                return bad(handler, "Session not found in CLI store", 404)
             changed = False
             if fresh_msgs and len(fresh_msgs) > len(current.messages):
                 # Prefix-equality guard: only extend if existing messages are a prefix of

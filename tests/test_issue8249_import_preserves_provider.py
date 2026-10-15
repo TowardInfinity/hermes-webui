@@ -190,6 +190,13 @@ def test_bare_billing_buckets_are_not_imported_as_providers(tmp_path):
         "model_config": json.dumps({"provider": "custom:my-relay"}),
         "billing_provider": "custom",
     }) == "custom:my-relay"
+    assert _model_provider_from_agent_row({
+        "model_config": json.dumps({
+            "provider": "xai-oauth",
+            "gateway_runtime": {"provider": "opencode-go"},
+        }),
+        "billing_provider": "custom",
+    }) == "opencode-go"
 
     db = tmp_path / "state.db"
     conn = sqlite3.connect(str(db))

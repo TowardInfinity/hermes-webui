@@ -220,6 +220,13 @@ def _model_provider_from_agent_row(row: dict) -> str | None:
         except (json.JSONDecodeError, TypeError):
             raw = None
     if isinstance(raw, dict):
+        runtime = raw.get("gateway_runtime")
+        if isinstance(runtime, dict):
+            runtime_provider = str(runtime.get("provider") or "").strip().lower()
+            # Newest route. The Agent resume path prefers this over the older
+            # top-level provider and the billing fallback.
+            if runtime_provider and runtime_provider != "default":
+                return runtime_provider
         provider = str(raw.get("provider") or "").strip().lower()
         if provider and provider != "default":
             return provider

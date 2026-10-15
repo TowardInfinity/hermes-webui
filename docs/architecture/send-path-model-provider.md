@@ -94,10 +94,10 @@ so it is scoped to the browser tab and to one session id.
 ## Import and materialize
 
 Opening a Desktop/CLI session copies the provider onto the sidecar before the
-send path runs. Lookup order is `model_config.provider`, then
-`billing_provider` when that value is a real provider. `auto` and `custom`
-are billing buckets, not identities, and stay unset so chat start still
-uses the profile provider.
+send path runs. Lookup order is `model_config.gateway_runtime.provider`, then
+`model_config.provider`, then `billing_provider` when that value is a real
+provider. `auto` and `custom` are billing buckets, not identities, and stay
+unset so chat start still uses the profile provider.
 
 The recent-session list publishes that value as `model_provider`. A saved
 link to an older session is not in that capped list. The single-row claim
