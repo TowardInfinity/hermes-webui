@@ -9305,7 +9305,16 @@ function lockComposerForClarify(placeholderText){
   // card is active (and survives page refresh / syncs across clients).
   const sid = S && S.session && S.session.session_id;
   if (sid && typeof _saveComposerDraftNow === 'function') {
-    _saveComposerDraftNow(sid, input.value || '', S.pendingFiles ? [...S.pendingFiles] : []);
+    const saveText = String(input.value || '');
+    const saveFiles = Array.isArray(S && S.pendingFiles) ? [...S.pendingFiles] : [];
+    try {
+      const saveResult = _saveComposerDraftNow(sid, saveText, saveFiles);
+      if (saveResult && typeof saveResult.catch === 'function') {
+        saveResult.catch((error)=>_handleComposerDraftPostFailure(error,sid,saveText,saveFiles));
+      }
+    } catch (error) {
+      _handleComposerDraftPostFailure(error,sid,saveText,saveFiles);
+    }
   }
   if(!_composerLockState){
     _composerLockState={
@@ -11012,22 +11021,33 @@ function renderTodoEmptyState(options={}){
 }
 
 function renderTodoRow(todo,options={}){
+  // ONE shared row renderer for all three Todos surfaces (sidebar panel,
+  // workspace-panel tab, in-chat tray). The tray used to hand-roll its own
+  // markup with tray-only class hooks, which duplicated this function and left
+  // dead CSS behind; it now calls this with {compact:true, rowClass:'...'}
+  // (reviewer re-gate 2026-10-08T03:10:50Z, "tidy the shared-row renderer").
   const td=todo||{};
+  const opts=options||{};
   const status=todoStatusKey(td.status);
   const visual=todoStatusVisual(status);
-  const showMetadata=!(options&&options.metadata===false);
+  const showMetadata=!(opts.metadata===false);
+  const compact=!!opts.compact;
+  const rowClass=opts.rowClass?(' '+String(opts.rowClass)):'';
   const isCompleted=status==='completed';
   const isCancelled=status==='cancelled';
   const contentColor=(isCompleted||isCancelled)?'var(--muted)':'var(--text)';
   const completedStyle=(isCompleted||isCancelled)?'text-decoration:line-through;opacity:.5':'';
   const metadata=showMetadata
-    ? `<div style="font-size:10px;color:var(--muted);margin-top:2px;opacity:.6">${esc(td.id)} · ${esc(status)}</div>`
+    ? `<div class="todos-meta" style="font-size:10px;color:var(--muted);margin-top:2px;opacity:.6">${esc(td.id)} · ${esc(status)}</div>`
     : '';
+  const gap=compact?8:10;
+  const padY=compact?5:6;
+  const contentSize=compact?'12.5px':'13px';
   return `
-    <div style="display:flex;align-items:flex-start;gap:10px;padding:6px 0;border-bottom:1px solid var(--border);">
-      <span style="font-size:14px;display:inline-flex;align-items:center;flex-shrink:0;margin-top:1px;color:${visual.color}">${renderTodoStatusIcon(status,14)}</span>
-      <div style="flex:1;min-width:0">
-        <div style="font-size:13px;color:${contentColor};${completedStyle};line-height:1.4">${esc(todoContent(td))}</div>
+    <div class="todos-row${rowClass}" style="display:flex;align-items:flex-start;gap:${gap}px;padding:${padY}px 0;border-bottom:1px solid var(--border);">
+      <span class="todos-status" style="font-size:14px;display:inline-flex;align-items:center;flex-shrink:0;margin-top:1px;color:${visual.color}">${renderTodoStatusIcon(status,14)}</span>
+      <div class="todos-body" style="flex:1;min-width:0">
+        <div class="todos-content" style="font-size:${contentSize};color:${contentColor};${completedStyle};line-height:1.4;overflow-wrap:anywhere">${esc(todoContent(td))}</div>
         ${metadata}
       </div>
     </div>`;
@@ -11044,6 +11064,373 @@ function _todosPanelIsActive(){
   return !!(panel&&panel.classList&&panel.classList.contains('active'));
 }
 
+// ────────────────────────────────────────────────────────────────────────
+// Chat todos: embedded collapsible task list at the top of the chat area.
+// Opt-in via the "Show task list in chat" checkbox (localStorage-backed,
+// frontend-only preference — no server settings round-trip needed).
+// When enabled, the sidebar Todos panel is hidden to avoid duplication.
+// ────────────────────────────────────────────────────────────────────────
+const CHAT_TODOS_LS_KEY='hermes-webui-chat-todos';
+let _chatTodosEnabled=null;             // null = uninitialised; true/false once known
+let _chatTodosInitialised=false;
+
+function _chatTodosReadPref(){
+  try{
+    const v=localStorage.getItem(CHAT_TODOS_LS_KEY);
+    // Default OFF (opt-in): the tray hides the sidebar Todos tab and paints a
+    // floating overlay in the transcript, so it must never appear for existing
+    // users who never asked for it. Only an explicit '1' turns it on.
+    if(v===null) return false;
+    return v==='1';
+  }catch(_){return false;}
+}
+function _chatTodosWritePref(v){
+  try{
+    // Persist both states explicitly ('1' enabled / '0' disabled). Removing the
+    // key on false would re-collide with the opt-in default and make a user's
+    // choice to enable the tray vanish on reload.
+    localStorage.setItem(CHAT_TODOS_LS_KEY,v?'1':'0');
+  }catch(_){}
+}
+function chatTodosEnabled(){
+  if(_chatTodosEnabled===null) _chatTodosEnabled=_chatTodosReadPref();
+  return _chatTodosEnabled;
+}
+function _setChatTodosEnabled(v){
+  _chatTodosEnabled=!!v;
+  _chatTodosWritePref(_chatTodosEnabled);
+  if(typeof _syncChatTodosRailVisibility==='function') _syncChatTodosRailVisibility();
+}
+function _syncChatTodosRailVisibility(){
+  // When the in-chat tray is active, hide the sidebar Todos panel so the
+  // user never has two competing todo surfaces.
+  const enabled=chatTodosEnabled();
+  if(enabled){
+    document.querySelectorAll('[data-panel="todos"]').forEach(function(el){
+      el.classList.add('nav-tab-hidden');
+    });
+  }else if(typeof _applyTabVisibility==='function'&&typeof _getHiddenTabs==='function'){
+    // Tray OFF: hand visibility back to its canonical owner. Unconditionally
+    // REMOVING nav-tab-hidden here also revealed a Todos entry the user had
+    // hidden independently through hidden_tabs, so an explicitly hidden tab
+    // reappeared immediately (or after reload). Deferring to
+    // _applyTabVisibility re-derives the tab's own preference instead.
+    //
+    // …but only once the mirror IS that preference. While a profile switch's
+    // /api/settings reconciliation is still in flight, localStorage still holds
+    // the PREVIOUS profile's hidden_tabs/tab_order, so re-deriving here would
+    // reimpose the old profile's tab visibility on the profile now in effect: a
+    // Todos entry the current profile hides pops back, or one it shows stays
+    // hidden, until settings refresh (greptile P1, 2026-10-08T20:06:51Z). Skip
+    // the window — the pending reconciliation re-runs _applyTabVisibility with
+    // the profile's own snapshot and already honours the tray's new state.
+    if(typeof _tabVisibilitySnapshotStale!=='function'||!_tabVisibilitySnapshotStale()){
+      _applyTabVisibility(_getHiddenTabs());
+    }
+  }
+  // If the sidebar Todos panel is currently open, bounce back to chat.
+  if(enabled){
+    const panel=document.getElementById('panelTodos');
+    if(panel&&panel.classList&&panel.classList.contains('active')&&typeof switchPanel==='function'){
+      switchPanel('chat',{fromRailClick:false});
+    }
+  }
+  // The workspace-panel Todos tab (Settings ▸ "Show Todos tab in workspace
+  // panel") is a third Todos surface: it must follow the tray too, otherwise
+  // the two settings contradict each other (reviewer re-gate 2026-10-07T18:08:02Z).
+  if(typeof _applyWorkspaceTodosTabVisibility==='function') _applyWorkspaceTodosTabVisibility();
+}
+// The tray is an in-flow strip, so the shell carries a marker class while it is
+// visible. CSS uses it to drop the floating Start jump pill below the strip
+// instead of letting it paint over the tray (reviewer re-gate 2026-10-07T18:08:02Z).
+let _chatTodosResizeObserver=null;
+// Last measured height of the strip's real box. The transcript is only re-pinned
+// when that box actually GREW (reviewer re-gate 2026-10-08T03:10:50Z).
+let _chatTodosRepinH=0;
+function _measureChatTodosTrayHeight(){
+  const tray=(typeof $==='function')?$('chatTodosPanel'):null;
+  if(!tray||tray.hidden) return 0;
+  try{ return (tray.getBoundingClientRect?tray.getBoundingClientRect().height:0)||0; }catch(_){ return 0; }
+}
+function _publishChatTodosHeight(){
+  // Measure the tray's ACTUAL box and publish it on the shell: CSS offsets the
+  // Start jump pill by it instead of the fixed 43px that only cleared the
+  // collapsed band and let the pill paint inside the expanded rows
+  // (re-gate 2026-10-07T20:13:25Z, [SHOULD-FIX] 2).
+  //
+  // Guarded on purpose: a hidden tray measures 0 and must never clobber a real
+  // height with 0. The observer below republishes as soon as the box is real
+  // again, so the guard no longer strands a stale value (re-gate
+  // 2026-10-07T23:49:23Z).
+  if(typeof document==='undefined'||!document.querySelector) return 0;
+  const shell=document.querySelector('.messages-shell');
+  if(!shell||!shell.style) return 0;
+  // The measured box is CEILed: the whole-tray cap below can leave a fractional
+  // height, and rounding DOWN shaved the Start pill's >=7px clearance
+  // (reviewer re-gate 2026-10-08T09:54:47Z, must-fix 1).
+  const h=Math.ceil(_measureChatTodosTrayHeight());
+  if(h>0&&shell.style.setProperty) shell.style.setProperty('--chat-todos-h',h+'px');
+  return h;
+}
+function _syncChatTodosShellClass(visible){
+  if(typeof document==='undefined'||!document.querySelector) return;
+  const shell=document.querySelector('.messages-shell');
+  if(shell&&shell.classList){
+    shell.classList.toggle('chat-todos-visible',!!visible);
+    if(!visible){
+      if(shell.style&&shell.style.removeProperty) shell.style.removeProperty('--chat-todos-h');
+      return;
+    }
+    _publishChatTodosHeight();
+  }
+}
+function _ensureChatTodosResizeObserver(){
+  // Lifecycle-owned tray observer. The strip's box changes on schedules that
+  // never call renderChatTodos()/toggleChatTodos(): resizing ACROSS the tray
+  // breakpoint (the strip grows 236px -> 276px at 393 -> 1440) and a hidden
+  // tray becoming visible again after Settings edits hydrate the list while
+  // chat is hidden (0 -> 276px, which kept the stale 77px and painted the
+  // whole Start pill inside the task rows). Observing the real box covers both,
+  // so the pill follows the tray's actual box instead of the last render's
+  // measurement (re-gate 2026-10-07T23:49:23Z).
+  if(typeof ResizeObserver!=='function') return;
+  if(typeof document==='undefined'||!document.querySelector) return;
+  const tray=(typeof $==='function')?$('chatTodosPanel'):null;
+  if(!tray) return;
+  if(_chatTodosResizeObserver&&_chatTodosResizeObserver._tray===tray) return;
+  if(_chatTodosResizeObserver&&_chatTodosResizeObserver.disconnect) _chatTodosResizeObserver.disconnect();
+  _chatTodosResizeObserver=null;
+  try{
+    const ro=new ResizeObserver(function(){
+      // Only a visible strip owns the pill offset: while chat is hidden the box
+      // measures 0 and publishing that would leave the pill un-offset. The
+      // hidden -> visible flip re-fires this observer with the real box.
+      const shell=document.querySelector('.messages-shell');
+      if(!(shell&&shell.classList&&shell.classList.contains('chat-todos-visible'))) return;
+      _publishChatTodosHeight();
+      // The bottom fade is a function of the tray's box too: a list that fit
+      // when it was rendered starts scrolling after a shorter viewport or a
+      // taller composer, and with scrollTop still 0 the cue stayed hidden, so
+      // the clipped list read as the complete list until something else
+      // refreshed it (Greptile P2 2026-10-09T21:45:10Z).
+      _updateChatTodosScrollCue();
+      // The repin's own growth gate decides whether the reader moves: a 0px
+      // hidden box records "nothing on screen", so the visible flip still counts
+      // as a real growth (reviewer re-gate 2026-10-08T03:10:50Z).
+      _repinChatTodosTranscript();
+    });
+    ro._tray=tray;
+    ro.observe(tray);
+    _chatTodosResizeObserver=ro;
+  }catch(_){ _chatTodosResizeObserver=null; }
+}
+function _syncChatTodosExpanded(open){
+  const tray=$('chatTodosPanel');
+  if(tray){
+    if(open) tray.classList.add('open');
+    else tray.classList.remove('open');
+  }
+  const head=$('chatTodosHead');
+  if(head&&head.setAttribute) head.setAttribute('aria-expanded',open?'true':'false');
+}
+function _chatTodosToggleEnabled(checked){
+  _setChatTodosEnabled(checked);
+  // The tray force-hides the sidebar Todos entry, so its visibility chip must be
+  // repainted here: toggling the tray from Settings changed nothing on screen
+  // while the chip kept reporting ON (re-gate 2026-10-07, static/ui.js:10503).
+  if(typeof _renderTabVisibilityChips==='function') _renderTabVisibilityChips();
+  // Keep the settings checkbox in sync for callers that toggle the tray from
+  // elsewhere (e.g. the tab-visibility chip that owns the same hide).
+  const prefCb=$('settingsChatTodosInChat');
+  if(prefCb) prefCb.checked=!!checked;
+  const tray=$('chatTodosPanel');
+  if(tray) tray.hidden=!checked;
+  // Enabling always (re)starts collapsed, and collapsing must drop the
+  // header's aria-expanded too — otherwise a tray expanded, turned off and
+  // turned back on is announced as expanded while its body is hidden.
+  _syncChatTodosExpanded(false);
+  renderChatTodos();
+  // Deliberately no whole-transcript rebuild here: the tray is an absolutely
+  // positioned overlay outside the message scroller, so toggling it changes no
+  // transcript layout (a full re-render cost ~256 ms at 300 messages).
+  //
+  // Deliberately NO appearance autosave either (reviewer re-gate
+  // 2026-10-08T23:19:27Z, static/ui.js:11074): the tray preference is persisted
+  // in localStorage by _setChatTodosEnabled above, whereas an appearance save
+  // would POST hidden_tabs/_getHiddenTabs() — a mirror that can still hold a
+  // stale server snapshot. Toggling the tray from Settings then clobbered a
+  // newer hidden_tabs a sibling client had written (verified over real HTTP:
+  // server []; toggling the tray saved ["todos","memory"] back). Explicit
+  // visibility-chip edits keep their own autosave.
+}
+
+// ── Chat todos summary ──────────────────────────────────────────────────
+function _currentTodos(){
+  // `todoStateMeta` is the sentinel for an explicit snapshot (live todo_state
+  // SSE or session cold-load). Without it, S.todos may hold the empty array
+  // hydration installs for an imported/legacy session whose tasks only exist
+  // as role:"tool" messages — returning that array would bypass the legacy
+  // renderer and hide a list that renders today. Explicit empty snapshots
+  // (meta present) still win.
+  if(S.todoStateMeta) return Array.isArray(S.todos)?S.todos:[];
+  if(typeof _legacyTodosFromMessages==='function'){
+    const legacy=_legacyTodosFromMessages();
+    if(Array.isArray(legacy)) return legacy;
+  }
+  return [];
+}
+function _chatTodosSummary(todos){
+  const active=todos.filter(t=>t&&t.status!=='completed'&&t.status!=='cancelled').length;
+  const total=todos.length;
+  if(!total) return {text:t('todos_no_active')||'No active tasks',active:0,total:0};
+  const text=active===0
+    ?t('todos_tray_summary_done',total)
+    :t('todos_tray_summary_active',active,total);
+  return {text,active,total};
+}
+function _repinChatTodosTranscript(){
+  // The tray is IN FLOW, so showing/growing it shrinks the transcript viewport.
+  // The earlier fix re-pinned on EVERY render path — including the feature-OFF
+  // default where the tray is hidden and nothing resized at all — which yanked a
+  // reader who had scrolled up with Auto-follow OFF back to the bottom
+  // (reviewer re-gate 2026-10-08T03:10:50Z, [SHOULD-FIX] 1). Two gates now:
+  //   1. Auto-follow OFF => never touch the scroll position (the setting only
+  //      suppresses AUTOMATIC following; a deliberate jump is explicit).
+  //   2. Re-pin only when the strip's measured box actually GREW. A shrink
+  //      cannot strand a pinned reader: a growing viewport only lowers
+  //      scrollHeight - clientHeight, which the browser clamps for us.
+  // The helper below is a no-op anyway when the reader scrolled away.
+  //
+  // The box must be measured BEFORE the Auto-follow gate (reviewer re-gate
+  // 2026-10-08T06:40:51Z, [SHOULD-FIX]): when the gate returned first, a hide
+  // with Auto-follow OFF never recorded the zero height, so a later re-show
+  // with follow ON compared against the stale pre-hide height, read "not
+  // grown", and skipped the re-pin — stranding a pinned reader. Tracking the
+  // box unconditionally (follow OUT of the measurement) keeps the baseline
+  // honest; only the ACTUAL re-pin stays gated. The measurement is CEILed here
+  // too, so the growth test compares against the SAME number the pill offset
+  // publishes (reviewer re-gate 2026-10-08T09:54:47Z, must-fix 1).
+  const h=Math.ceil(_measureChatTodosTrayHeight());
+  const grew=h>_chatTodosRepinH;
+  _chatTodosRepinH=h;
+  if(typeof window!=='undefined'&&window._autoScrollFollow===false) return;
+  if(!grew) return;
+  if(typeof _repinMessagesAfterComposerResize==='function') _repinMessagesAfterComposerResize();
+}
+function renderChatTodos(){
+  if(typeof $!=='function'||typeof document==='undefined') return;
+  const tray=$('chatTodosPanel');
+  if(!tray) return;
+  // Keep the lifecycle-owned box observer alive across every path that can
+  // (re)create or re-show the tray (re-gate 2026-10-07T23:49:23Z).
+  _ensureChatTodosResizeObserver();
+  if(!chatTodosEnabled()){
+    tray.hidden=true;
+    _syncChatTodosShellClass(false);
+    _repinChatTodosTranscript();
+    return;
+  }
+  const todos=_currentTodos();
+  if(!todos.length){
+    tray.hidden=true;
+    _syncChatTodosShellClass(false);
+    _repinChatTodosTranscript();
+    return;
+  }
+  tray.hidden=false;
+  _syncChatTodosShellClass(true);
+  _repinChatTodosTranscript();
+  // ONE progress label (reviewer re-gate 2026-10-07T18:08:02Z): the header
+  // used to print the active count twice (summary + counter). The summary span
+  // is generated text, so it also no longer carries data-i18n and is filled
+  // here for every locale.
+  const summary=_chatTodosSummary(todos);
+  const summaryEl=$('chatTodosSummary');
+  if(summaryEl) summaryEl.textContent=summary.text;
+  if(!tray.classList.contains('open')){
+    // Collapsed: header only. Render body lazily when expanded.
+    return;
+  }
+  const body=$('chatTodosBody');
+  if(!body) return;
+  // ONE shared row renderer (sidebar panel / workspace Todos tab / this tray), so
+  // the tray can never drift from the other Todos surfaces (reviewer re-gate
+  // 2026-10-08T03:10:50Z, "tidy the shared-row renderer").
+  const rows=renderTodoRows(todos,{metadata:false,compact:true,rowClass:'chat-todos-row'});
+  // The rows live in their own centred column so they line up with the
+  // transcript's reading column instead of spanning the full shell width
+  // (reviewer re-gate 2026-10-08T03:10:50Z).
+  body.innerHTML=`<div class="chat-todos-rows">${rows||`<div class="chat-todos-empty">${esc(t('todos_no_active'))}</div>`}</div>`;
+  _wireChatTodosScrollCue();
+  _updateChatTodosScrollCue();
+  // The expanded body's height depends on the row count (and growing a list is
+  // the case the reviewer measured a 199px gap on), so re-publish the strip
+  // height for the Start pill and re-pin the transcript to its new bottom.
+  _syncChatTodosShellClass(true);
+  _repinChatTodosTranscript();
+}
+function toggleChatTodos(){
+  const tray=$('chatTodosPanel');
+  if(!tray) return;
+  const isOpen=!tray.classList.contains('open');
+  _syncChatTodosExpanded(isOpen);
+  if(isOpen) renderChatTodos();
+  // Expanding/collapsing resizes the in-flow strip, so refresh the published
+  // height (Start pill offset) and re-pin the transcript on BOTH transitions —
+  // collapsing must not leave the scroller short either (re-gate
+  // 2026-10-07T20:13:25Z).
+  _syncChatTodosShellClass(!tray.hidden);
+  _repinChatTodosTranscript();
+  // Opening/closing the disclosure changes which rows are visible, so the
+  // "more below" cue is re-derived on both transitions (re-gate 2026-10-08).
+  _updateChatTodosScrollCue();
+}
+function _initChatTodos(){
+  if(_chatTodosInitialised) return;
+  _chatTodosInitialised=true;
+  if(typeof document==='undefined') return;
+  _chatTodosEnabled=chatTodosEnabled();
+  _syncChatTodosRailVisibility();
+  const tray=$('chatTodosPanel');
+  if(tray){
+    if(!chatTodosEnabled()){
+      tray.hidden=true;
+      _syncChatTodosShellClass(false);
+      return;
+    }
+    tray.hidden=false;
+    // In-flow strip: start collapsed so it costs only the ~35px header band.
+    _syncChatTodosShellClass(true);
+    _wireChatTodosScrollCue();
+    renderChatTodos();
+  }
+}
+
+// ── Overflow cue for the capped expanded body ──────────────────────────────
+// Below ~768px the body is capped (200px) and its scrollbar is an overlay that
+// mobile browsers only reveal while scrolling, so a capped list looked like a
+// complete one (reviewer re-gate 2026-10-08T03:10:50Z, "a mobile overflow cue
+// when the capped body scrolls"). The cue is a bottom fade published on the
+// wrapper, shown only while there is still content below the fold.
+let _chatTodosCueWired=false;
+function _wireChatTodosScrollCue(){
+  if(_chatTodosCueWired) return;
+  const body=$('chatTodosBody');
+  if(!body||!body.addEventListener) return;
+  _chatTodosCueWired=true;
+  body.addEventListener('scroll',_updateChatTodosScrollCue,{passive:true});
+}
+function _updateChatTodosScrollCue(){
+  const body=$('chatTodosBody');
+  const wrap=$('chatTodosBodyWrap');
+  if(!body||!wrap||!wrap.classList) return;
+  let moreBelow=false;
+  try{
+    moreBelow=(body.scrollHeight-body.clientHeight)>2&&(body.scrollHeight-body.scrollTop-body.clientHeight)>2;
+  }catch(_){ moreBelow=false; }
+  wrap.classList.toggle('chat-todos-overflowing',moreBelow);
+}
+
 function scheduleTodosRefresh(){
   // Idempotent: many `todo_state` events fire on each tool result, but
   // only the latest snapshot needs to paint.  RAF lets us coalesce
@@ -11052,6 +11439,7 @@ function scheduleTodosRefresh(){
   if(typeof requestAnimationFrame!=='function'){
     if(typeof loadTodos==='function') loadTodos();
     if(typeof _refreshWorkspacePanelTodos==='function') _refreshWorkspacePanelTodos();
+    if(typeof renderChatTodos==='function') renderChatTodos();
     return;
   }
   _todosRenderRafId=requestAnimationFrame(()=>{
@@ -11059,6 +11447,7 @@ function scheduleTodosRefresh(){
     const sidebarActive=_todosPanelIsActive();
     if(sidebarActive&&typeof loadTodos==='function') loadTodos();
     if(typeof _refreshWorkspacePanelTodos==='function') _refreshWorkspacePanelTodos();
+    if(typeof renderChatTodos==='function') renderChatTodos();
   });
 }
 
@@ -11474,6 +11863,8 @@ function _syncSystemHealthMonitorVisibility(){
 document.addEventListener('visibilitychange',_syncSystemHealthMonitorVisibility);
 if(document.readyState==='loading') document.addEventListener('DOMContentLoaded',startSystemHealthMonitor);
 else startSystemHealthMonitor();
+  if(document.readyState==='loading') document.addEventListener('DOMContentLoaded',_initChatTodos);
+  else _initChatTodos();
 
 // ── Hermes agent/gateway heartbeat alert (#716) ──
 const AGENT_HEALTH_INTERVAL_MS=30000;
@@ -11615,6 +12006,11 @@ function _formatUpdateTargetStatus(label,info){
     :(info.branch?` (${info.branch})`:'');
   const noun=info.release_based?'release':'update';
   return `${label}${release}: ${info.behind} ${noun}${info.behind>1?'s':''}`;
+}
+function _updateTargetArrowNamesTag(info,tag){
+  // True only when THIS target's own status renders "(current -> tag)", so a "Latest tag" suffix would repeat it
+  // (#6859). Never search the combined status text: another target's version or branch can contain the tag string.
+  return !!(tag&&info&&info.release_based&&info.latest_version===tag&&_formatUpdateTargetStatus('',info));
 }
 function _formatManualUpdateInstruction(info){
   if(!(info&&info.no_git&&info.manual_update&&info.behind>0)) return null;
@@ -13139,6 +13535,116 @@ function _worklogDetailScrollableBody(el){
   if(!el||!el.querySelector) return null;
   return el.querySelector('.thinking-card-body,.tool-card-detail');
 }
+// Live thinking tail-follow: reasoning text that streams into an expanded
+// thinking card should keep scrolling into view the way the message pane
+// follows its bottom, while a reader who scrolls up inside the card is held
+// in place. Tail-follow state is EXPLICIT to live thinking rows: a settled
+// card is never seeded or pinned, so it keeps master's open-at-top reading
+// behavior. The latch below records per-body follow intent on live bodies
+// only (true at stream start, flipped by the passive scroll listener as the
+// reader moves: hold away from the tail, resume at the tail), and the detail
+// capture/restore path carries it across DOM rebuilds via the atBottom
+// snapshot field, which is recorded only for bodies that participate.
+const _THINKING_TAIL_STICK_PX=24;
+function _thinkingRowIsLive(row){
+  if(!row||!row.getAttribute) return false;
+  if(row.getAttribute('data-live-thinking-row')==='1') return true;
+  if(row.getAttribute('data-live-thinking')==='1') return true;
+  if(row.getAttribute('data-thinking-active')==='1') return true;
+  return !!(row.closest&&row.closest('[data-live-anchor-scene-owner="1"],[data-live-tool-call-group="1"],[data-live-assistant-turn="1"]'));
+}
+function _bindThinkingTailFollow(body, atTail){
+  if(!body||typeof body.addEventListener!=='function') return;
+  // atTail===undefined: a live body's own write seeds follow=true only when
+  // the latch is unset. An explicit atTail is AUTHORITATIVE (restore replaying
+  // captured intent onto a rebuilt body): it overrides the latch, or a body
+  // recreated mid-hold would be re-seeded true by its creation write and yank
+  // the reader to the bottom on the next rebuild.
+  if(atTail===undefined){
+    if(body._thinkingTailFollow===undefined) body._thinkingTailFollow=true;
+  }else{
+    body._thinkingTailFollow=!!atTail;
+  }
+  if(body._thinkingTailFollowBound) return;
+  body._thinkingTailFollowBound=true;
+  body.addEventListener('scroll',()=>{
+    const room=Math.max(0,(Number(body.scrollHeight)||0)-(Number(body.clientHeight)||0));
+    body._thinkingTailFollow=room-(Number(body.scrollTop)||0)<=_THINKING_TAIL_STICK_PX;
+  },{passive:true});
+}
+function _thinkingCardOpened(card){
+  // Shared by _toggleThinkingCard and _setTransparentCardOpen. The open
+  // transition animates the body height from zero, so measuring immediately
+  // classifies even a card that will fit when fully open as away from the tail
+  // (#7988 review) — settle the follow state once the layout is stable. Until
+  // then the latch stays unset and no write may pin (follow requires ===true).
+  const body=card&&card.querySelector?card.querySelector('.thinking-card-body'):null;
+  if(!body) return;
+  // Settled history must never acquire follow state: capture trusts the latch
+  // over the real position, so binding here makes a persisted card jump to the
+  // bottom on any later re-render (e.g. a 1280->390 reflow) (#7988 review).
+  const row=body.closest?body.closest('.msg,.thinking-row,[data-live-thinking-row]'):null;
+  if(typeof _thinkingRowIsLive==='function'&&!_thinkingRowIsLive(row||card)) return;
+  let done=false;
+  // Published so both tail writers can exclude a body whose open animation is
+  // still running: a delta landing inside the settle window must not pin a
+  // reader who is holding at the top (#7988 review).
+  // Each open supersedes the previous one's settle window. Without this, a
+  // stale timer from an earlier open (quick close+reopen) fires mid-animation
+  // of the current open and strands a card that will fit on HOLD (#7988
+  // review). A stale settle is a complete no-op: it must not clear the new
+  // settling flag or seed anything.
+  body._thinkingTailSettleGen=(Number(body._thinkingTailSettleGen)||0)+1;
+  const gen=body._thinkingTailSettleGen;
+  body._thinkingTailSettling=true;
+  const settle=(ev)=>{
+    if(gen!==body._thinkingTailSettleGen){
+      if(typeof body.removeEventListener==='function') body.removeEventListener('transitionend', settle);
+      return;
+    }
+    // Any transitionend on the body fires this, but opacity finishes well
+    // before max-height — measuring then reads a mid-animation height and
+    // seeds HOLD on a card that actually fits (#7988 review).
+    if(ev&&ev.propertyName&&ev.propertyName!=='max-height') return;
+    if(ev&&ev.target&&ev.target!==body) return;
+    if(done) return;
+    done=true;
+    body._thinkingTailSettling=false;
+    if(typeof body.removeEventListener==='function') body.removeEventListener('transitionend', settle);
+    // Closed again before the transition finished (quick re-toggle): leave the
+    // latch untouched so the reopen re-arms and seeds from a real layout,
+    // instead of stranding a live card on a collapsed-body measurement.
+    if(card&&card.classList&&!card.classList.contains('open')) return;
+    // Re-check at fire time, not at arm time: a scroll between open and
+    // settle (or a refresh that re-armed this on an already-open card) must
+    // not yank the reader (#7988 review). Seed only if still unset, pin only
+    // if still following.
+    if(body._thinkingTailFollow===undefined&&typeof _bindThinkingTailFollow==='function'){
+      _bindThinkingTailFollow(body, _worklogDetailBodyAtTail(body));
+    }
+    if(body._thinkingTailFollow===true){
+      body.scrollTop=Math.max(0,(Number(body.scrollHeight)||0)-(Number(body.clientHeight)||0));
+    }
+  };
+  if(typeof body.addEventListener==='function') body.addEventListener('transitionend', settle);
+  // Fallback when no transition runs (reduced motion, no CSS transition).
+  if(typeof setTimeout==='function') setTimeout(settle, 350);
+}
+function _toggleThinkingCard(card){
+  if(!card||!card.classList) return;
+  const opening=!card.classList.contains('open');
+  card.classList.toggle('open', opening);
+  if(opening) _thinkingCardOpened(card);
+}
+function _worklogDetailBodyAtTail(body){
+  if(!body) return true;
+  if(body._thinkingTailFollow===true) return true;
+  if(body._thinkingTailFollow===false) return false;
+  // Unbound body (e.g. a settled card that never streamed): fall back to the
+  // literal scroll position.
+  const room=Math.max(0,(Number(body.scrollHeight)||0)-(Number(body.clientHeight)||0));
+  return room-(Number(body.scrollTop)||0)<=_THINKING_TAIL_STICK_PX;
+}
 function _setWorklogDetailDisclosureOpen(el, open){
   if(!el||!el.classList) return;
   // #5966 (Codex F2 r2): restoring an OPEN state on a settled Transparent Stream
@@ -13179,10 +13685,21 @@ function _captureWorklogDetailDisclosureState(root){
     const key=_worklogDetailDisclosureKeyForElement(el, counts);
     if(!key) return;
     const body=_worklogDetailScrollableBody(el);
-    state.set(key,{
+    // atBottom is tail-follow state and is recorded ONLY for live thinking
+    // bodies that participate in tail-follow. Tool-card details and settled
+    // thinking cards keep master's plain absolute-offset restore. Liveness is
+    // part of the gate: a completed card keeps its streaming latch, and
+    // trusting that latch in capture would jump settled history on any later
+    // re-render (#7988 review).
+    const rowForLiveness=el.closest?el.closest('.agent-activity-thinking,.thinking-card-row,.thinking-row'):null;
+    const rowLive=typeof _thinkingRowIsLive==='function'?_thinkingRowIsLive(rowForLiveness):true;
+    const participates=!!(body&&body.classList&&body.classList.contains('thinking-card-body')&&body._thinkingTailFollow!==undefined&&rowLive);
+    const snap={
       open:_worklogDetailDisclosureIsOpen(el),
       scrollTop:body?Math.max(0,Number(body.scrollTop)||0):0,
-    });
+    };
+    if(participates) snap.atBottom=_worklogDetailBodyAtTail(body);
+    state.set(key,snap);
   });
   return state;
 }
@@ -13198,9 +13715,58 @@ function _restoreWorklogDetailDisclosureState(root, state){
     const open=(saved&&typeof saved==='object'&&'open' in saved)?saved.open:saved;
     _setWorklogDetailDisclosureOpen(el, open);
     const scrollTop=(saved&&typeof saved==='object')?Number(saved.scrollTop):0;
-    if(open&&Number.isFinite(scrollTop)&&scrollTop>0){
-      const body=_worklogDetailScrollableBody(el);
-      if(body) body.scrollTop=Math.min(scrollTop, Math.max(0, body.scrollHeight-body.clientHeight));
+    // Only snapshots that carried tail-follow state (participating live
+    // thinking bodies) bind the rebuilt body; everything else — tool details,
+    // settled cards, legacy boolean snapshots — keeps master's plain
+    // absolute-offset restore with no follow latch. The DESTINATION row must
+    // be live too: a settled destination ignores atBottom and restores its
+    // saved absolute offset (#7988 review).
+    const destRow=el.closest?el.closest('.agent-activity-thinking,.thinking-card-row,.thinking-row'):null;
+    const destLive=typeof _thinkingRowIsLive==='function'?_thinkingRowIsLive(destRow):true;
+    const hasFollow=!!(destLive&&saved&&typeof saved==='object'&&'atBottom' in saved);
+    const atBottom=hasFollow&&saved.atBottom===true;
+    const body=_worklogDetailScrollableBody(el);
+    // Follow intent is restored for live destinations whether or not the card
+    // is open: a collapsed following card must resume follow on reopen, not be
+    // re-measured at its top and put on hold (#7988 review). Nothing scrolls
+    // while closed — only the latch is carried.
+    if(body&&hasFollow&&typeof _bindThinkingTailFollow==='function') _bindThinkingTailFollow(body, atBottom);
+    if(open){
+      if(body){
+        // Carry the captured follow/hold intent across the rebuild (seeded
+        // WITH its scroll listener so later reader movement still counts) and
+        // re-pin tail readers to the NEW bottom — content may have grown while
+        // the DOM was rebuilt. Readers who had scrolled up get their absolute
+        // offset replayed.
+        // The re-pin reads scrollHeight; skip it on a collapsed card (the tail
+        // read forces a layout) — _toggleThinkingCard re-pins on open.
+        const elOpen=!el.classList||el.classList.contains('open');
+        if(atBottom&&elOpen){
+          body.scrollTop=Math.max(0, body.scrollHeight-body.clientHeight);
+        }else if(Number.isFinite(scrollTop)&&scrollTop>0){
+          body.scrollTop=Math.min(scrollTop, Math.max(0, body.scrollHeight-body.clientHeight));
+        }
+        // A live body whose follow state was never established — the first
+        // open was interrupted by this very rebuild and its settle window died
+        // with the old body — must finish opening, or it stays follow-less
+        // forever (#7988 review).
+        if(destLive&&body.classList&&body.classList.contains('thinking-card-body')&&body._thinkingTailFollow===undefined){
+          // A body that is inserted and opened in the same task runs no
+          // transition, so it is already at final layout and can be seeded
+          // immediately. This is the common case in compact_worklog, where
+          // every delta recreates the row and a replacement body would be
+          // discarded before its settle window ever fires (#7988 review).
+          if(elOpen&&!body._thinkingTailSettling&&(Number(body.clientHeight)||0)>0&&typeof _bindThinkingTailFollow==='function'){
+            _bindThinkingTailFollow(body, _worklogDetailBodyAtTail(body));
+            if(body._thinkingTailFollow===true) body.scrollTop=Math.max(0,(Number(body.scrollHeight)||0)-(Number(body.clientHeight)||0));
+          }else if(typeof _thinkingCardOpened==='function'){
+            // Mid-transition replacement (clientHeight still 0): arm the
+            // settle window on the REPLACEMENT body so it seeds from its real
+            // position once the open finishes.
+            _thinkingCardOpened(el);
+          }
+        }
+      }
     }
   });
 }
@@ -13209,15 +13775,19 @@ function _thinkingCardHtml(text, open){
   const copyBtn=`<button class="thinking-copy-btn" onclick="event.stopPropagation();_copyThinkingText(this)" title="${t('copy')}" aria-label="${t('copy')}">${li('copy',12)}</button>`;
   const shouldOpen=!!open||_worklogDetailsExpandedDefault();
   const classes=`thinking-card${shouldOpen?' open':''}`;
-  return `<div class="${classes}"><div class="thinking-card-header" onclick="this.parentElement.classList.toggle('open')"><span class="thinking-card-icon">${li('lightbulb',14)}</span><span class="thinking-card-label">${t('thinking')}</span><span class="thinking-card-btn-row">${copyBtn}<span class="thinking-card-toggle">${li('chevron-right',12)}</span></span></div><div class="thinking-card-body"><pre>${esc(clean)}</pre></div></div>`;
+  return `<div class="${classes}"><div class="thinking-card-header" onclick="_toggleThinkingCard(this.parentElement)"><span class="thinking-card-icon">${li('lightbulb',14)}</span><span class="thinking-card-label">${t('thinking')}</span><span class="thinking-card-btn-row">${copyBtn}<span class="thinking-card-toggle">${li('chevron-right',12)}</span></span></div><div class="thinking-card-body"><pre>${esc(clean)}</pre></div></div>`;
 }
 function isSimplifiedToolCalling(){
   return window._simplifiedToolCalling!==false;
 }
-function _thinkingActivityNode(text, open, disclosureKey){
+function _thinkingActivityNode(text, open, disclosureKey, live){
   const row=document.createElement('div');
   row.className='agent-activity-thinking';
   row.setAttribute('data-worklog-thinking-card','1');
+  // Mark live rows BEFORE the creation write: the row is still detached here,
+  // and tail-follow must know this body is allowed to follow while settled
+  // cards are not.
+  if(live) row.setAttribute('data-live-thinking-row','1');
   if(disclosureKey) row.setAttribute('data-thinking-key', String(disclosureKey));
   row.innerHTML=_thinkingCardHtml(text, open);
   _renderThinkingInto(row,text);
@@ -13558,7 +14128,13 @@ function _setTransparentCardOpen(card, open){
   if(expanded&&row&&row.getAttribute('data-transparent-detail-deferred')==='1'){
     _materializeTransparentToolDetail(row);
   }
+  const wasOpen=!!(card.classList&&card.classList.contains('open'));
   card.classList.toggle('open',expanded);
+  // Arm follow-state settling only on a real closed→open transition. The
+  // rehydrate path re-applies the current open state on every refresh; arming
+  // there would schedule a delayed pin on an already-open card that can fire
+  // after the reader scrolled up (#7988 review).
+  if(expanded&&!wasOpen&&typeof _thinkingCardOpened==='function') _thinkingCardOpened(card);
   if(row) row.setAttribute('data-expanded',expanded?'1':'0');
   const header=card.querySelector('.tool-card-header,.thinking-card-header');
   if(header) header.setAttribute('aria-expanded',expanded?'true':'false');
@@ -14594,7 +15170,7 @@ function _appendWorklogStep(group, anchor, cards, thinkingText, opts){
     const thinkingKey=(opts&&opts.thinkingKey)||`reason:${String(thinkingText).trim()}`;
     const thinkingDisclosureKey=(opts&&opts.thinkingDisclosureKey)||thinkingKey;
     if(!seenReasons||!seenReasons.has(thinkingKey)){
-      const thinking=_thinkingActivityNode(thinkingText, false, thinkingDisclosureKey);
+      const thinking=_thinkingActivityNode(thinkingText, false, thinkingDisclosureKey, !!(opts&&opts.live));
       if(thinking){
         list.appendChild(thinking);
         wroteProse=true;
@@ -14786,7 +15362,7 @@ function _anchorSceneNodeForRow(row, opts){
     if(window._showThinking===false) return null;
     const text=String(row.text||row.thinking&&row.thinking.text||'').trim();
     if(!text) return null;
-    node=_thinkingActivityNode(text, false, row.row_id||row.local_id||'anchor-thinking');
+    node=_thinkingActivityNode(text, false, row.row_id||row.local_id||'anchor-thinking', !settled);
   }else if(row.role==='tool'){
     node=buildToolCard(_anchorSceneToolCallFromRow(row,opts));
   }else if(row.role==='lifecycle'){
@@ -14861,7 +15437,7 @@ function _anchorSceneTransparentNodeForRow(row, opts){
     if(window._showThinking===false) return null;
     const text=String(row.text||row.thinking&&row.thinking.text||'').trim();
     if(!text) return null;
-    node=_decorateTransparentEventRow(_thinkingActivityNode(text,false,row.row_id||row.local_id||'anchor-thinking'),{
+    node=_decorateTransparentEventRow(_thinkingActivityNode(text,false,row.row_id||row.local_id||'anchor-thinking', live),{
       type:'thinking',
       text,
       preview:text,
@@ -15465,8 +16041,23 @@ function _refreshTransparentThinkingLiveRow(existing, node){
   const existingPre = existing.querySelector('.thinking-card-body pre');
   const nodePre = node.querySelector('.thinking-card-body pre');
   if(!existingPre || !nodePre) return false;
+  const thinkingBody = existingPre.closest ? existingPre.closest('.thinking-card-body') : null;
+  // Same tail-follow rule as _renderThinkingInto: only LIVE, OPEN thinking
+  // rows may seed the follow latch or move their body to the tail (a
+  // collapsed body's tail read would force a layout per delta).
+  const thinkingLive = typeof _thinkingRowIsLive==='function'?_thinkingRowIsLive(existing):true;
+  const thinkingCard = thinkingBody&&thinkingBody.closest?thinkingBody.closest('.thinking-card'):null;
+  const thinkingOpen = !thinkingCard||(thinkingCard.classList&&thinkingCard.classList.contains('open'));
+  // A body still running its open animation is excluded: seeding or pinning
+  // inside that window yanks a reader holding at the top (#7988 review).
+  const thinkingSettling = !!(thinkingBody&&thinkingBody._thinkingTailSettling);
+  if(thinkingBody&&thinkingLive&&thinkingOpen&&!thinkingSettling&&typeof _bindThinkingTailFollow==='function') _bindThinkingTailFollow(thinkingBody);
+  const thinkingFollow = thinkingBody&&thinkingLive&&thinkingOpen&&!thinkingSettling&&thinkingBody._thinkingTailFollow===true;
   const nextText = String(nodePre.textContent || '');
-  if(existingPre.textContent !== nextText) existingPre.textContent = nextText;
+  if(existingPre.textContent !== nextText){
+    existingPre.textContent = nextText;
+    if(thinkingFollow) thinkingBody.scrollTop=Math.max(0,(Number(thinkingBody.scrollHeight)||0)-(Number(thinkingBody.clientHeight)||0));
+  }
   const nodePreview = node.querySelector('.transparent-event-thinking-preview');
   const previewText = nodePreview ? String(nodePreview.textContent || '') : nextText;
   if(typeof _decorateTransparentEventRow === 'function'){
@@ -20105,7 +20696,7 @@ function renderMessages(options){
             // Echoed reasoning already rendered for this turn — skip the duplicate.
           }else{
             if(_thinkKey)_seen.add(_thinkKey);
-            const thinkingRow=_decorateTransparentEventRow(_thinkingActivityNode(event.thinkingText,false),{
+            const thinkingRow=_decorateTransparentEventRow(_thinkingActivityNode(event.thinkingText,false,null,false),{
               type:'thinking',
               text:event.thinkingText,
               preview:event.thinkingText,
@@ -22497,7 +23088,7 @@ function _thinkingMarkup(text=''){
   const clean=_sanitizeThinkingDisplayText(text);
   const openClass=_worklogDetailsExpandedDefault()?' open':'';
   return (clean&&String(clean).trim())
-    ? `<div class="thinking-card${openClass}"><div class="thinking-card-header" onclick="this.parentElement.classList.toggle('open')"><span class="thinking-card-icon">${li('lightbulb',14)}</span><span class="thinking-card-label">${t('thinking')}</span><span class="thinking-card-toggle">${li('chevron-right',12)}</span></div><div class="thinking-card-body"><pre>${esc(String(clean).trim())}</pre></div></div>`
+    ? `<div class="thinking-card${openClass}"><div class="thinking-card-header" onclick="_toggleThinkingCard(this.parentElement)"><span class="thinking-card-icon">${li('lightbulb',14)}</span><span class="thinking-card-label">${t('thinking')}</span><span class="thinking-card-toggle">${li('chevron-right',12)}</span></div><div class="thinking-card-body"><pre>${esc(String(clean).trim())}</pre></div></div>`
     : `<div class="thinking"><div class="dot"></div><div class="dot"></div><div class="dot"></div></div>`;
 }
 function _renderThinkingInto(row,text=''){
@@ -22509,7 +23100,26 @@ function _renderThinkingInto(row,text=''){
   }
   const pre=row.querySelector('.thinking-card-body pre');
   if(pre){
+    const body=pre.closest?pre.closest('.thinking-card-body'):null;
+    // Tail-follow applies to LIVE thinking rows only. A settled card (or any
+    // body whose reader has scrolled up) keeps its scroll position: a creation
+    // write must never seed the follow latch or the next rebuild would jump a
+    // settled top-of-card reader to the bottom.
+    const live=typeof _thinkingRowIsLive==='function'?_thinkingRowIsLive(row):true;
+    // Collapsed cards neither bind nor pin: the tail read forces a layout on
+    // every delta (#7988 review) and the reader cannot see the stream anyway.
+    // A body that opens later seeds its follow state from its real position
+    // in _toggleThinkingCard.
+    const card=body&&body.closest?body.closest('.thinking-card'):null;
+    const open=!card||(card.classList&&card.classList.contains('open'));
+    // A body still running its open animation is excluded: seeding or pinning
+    // inside that window yanks a reader holding at the top (#7988 review).
+    const settling=!!(body&&body._thinkingTailSettling);
+    if(body&&live&&open&&!settling&&typeof _bindThinkingTailFollow==='function') _bindThinkingTailFollow(body);
+    const follow=body&&live&&open&&!settling&&body._thinkingTailFollow===true;
+    const changed=pre.textContent!==clean;
     pre.textContent=clean;
+    if(follow&&changed) body.scrollTop=Math.max(0,(Number(body.scrollHeight)||0)-(Number(body.clientHeight)||0));
     return;
   }
   row.innerHTML=_thinkingMarkup(text);
@@ -22527,6 +23137,7 @@ function finalizeThinkingCard(){
       row.removeAttribute('id');
       row.removeAttribute('data-thinking-active');
       row.removeAttribute('data-live-thinking');
+      row.removeAttribute('data-live-thinking-row');
     }
     return;
   }
@@ -22560,6 +23171,7 @@ function finalizeThinkingCard(){
     turn.querySelectorAll('.agent-activity-thinking[data-thinking-active="1"]').forEach(active=>{
       active.removeAttribute('data-thinking-active');
       active.removeAttribute('data-live-thinking');
+      active.removeAttribute('data-live-thinking-row');
     });
     _syncToolCallGroupSummary(group);
   }
@@ -22624,7 +23236,7 @@ function appendThinking(text='', options){
     if(isTransparentStream()){
       let row=blocks.querySelector(`.agent-activity-thinking[data-live-thinking="1"][data-live-thinking-key="${CSS.escape(thinkingKey)}"]`);
       if(!row){
-        row=_thinkingActivityNode(clean, false);
+        row=_thinkingActivityNode(clean, false, null, true);
         row.id='thinkingRow';
         row.setAttribute('data-live-thinking','1');
         row.setAttribute('data-live-thinking-key',thinkingKey);
@@ -22635,6 +23247,7 @@ function appendThinking(text='', options){
             el.removeAttribute('id');
             el.removeAttribute('data-thinking-active');
             el.removeAttribute('data-live-thinking');
+            el.removeAttribute('data-live-thinking-row');
           }
         });
         row.setAttribute('data-thinking-active','1');
@@ -22673,7 +23286,7 @@ function appendThinking(text='', options){
     if(list){
       let row=list.querySelector(`.agent-activity-thinking[data-live-thinking="1"][data-live-thinking-key="${CSS.escape(thinkingKey)}"]`);
       if(!row){
-        row=_thinkingActivityNode(clean, false, thinkingKey);
+        row=_thinkingActivityNode(clean, false, thinkingKey, true);
         row.setAttribute('data-live-thinking','1');
         row.setAttribute('data-live-thinking-key',thinkingKey);
         if(segmentSeq) row.setAttribute('data-live-segment-seq',segmentSeq);
@@ -22682,6 +23295,7 @@ function appendThinking(text='', options){
           if(el!==row){
             el.removeAttribute('data-thinking-active');
             el.removeAttribute('data-live-thinking');
+            el.removeAttribute('data-live-thinking-row');
           }
         });
         row.setAttribute('data-thinking-active','1');
@@ -22704,6 +23318,7 @@ function removeThinking(){
       row.removeAttribute('id');
       row.removeAttribute('data-thinking-active');
       row.removeAttribute('data-live-thinking');
+      row.removeAttribute('data-live-thinking-row');
     });
     if(liveTurn&&blocks&&!blocks.children.length) liveTurn.remove();
     return;
@@ -23972,10 +24587,39 @@ function _showUploadTooLarge(file){
   if(typeof setStatus==='function')setStatus(`\u274c ${message}`);
   else if(typeof showToast==='function')showToast(message,5000,'error');
 }
+// Mobile camera/photo pickers (iOS Safari in particular) hand every photo the
+// same generic name ("image.jpg"). Dropping a file just because its name is
+// taken silently loses the second photo. Only skip a true duplicate (same
+// name, size and mtime); otherwise keep the file under a collision-free name.
+function _pendingFileUniqueName(name){
+  const taken=new Set((S.pendingFiles||[]).map(p=>p&&p.name));
+  if(!taken.has(name))return name;
+  // Keep compound archive extensions whole (.tar.gz etc.) so the renamed copy
+  // still matches _ARCHIVE_EXTS and is extracted rather than uploaded as-is.
+  const compound=/\.tar\.(gz|bz2|xz)$/i.exec(name);
+  const dot=compound?compound.index:name.lastIndexOf('.');
+  const stem=dot>0?name.slice(0,dot):name;
+  const ext=dot>0?name.slice(dot):'';
+  for(let i=2;;i++){
+    const candidate=`${stem}-${i}${ext}`;
+    if(!taken.has(candidate))return candidate;
+  }
+}
+// A pending file's identity is its ORIGINAL name (before any collision rename).
+function _pendingFileOrigName(p){return (p&&p._origName)||(p&&p.name);}
 function addFiles(files){
   for(const f of files){
     if(f&&f.size>MAX_UPLOAD_BYTES){_showUploadTooLarge(f);continue;}
-    if(!S.pendingFiles.find(p=>p.name===f.name))S.pendingFiles.push(f);
+    // True duplicate: same original name, size and mtime as ANY pending file,
+    // including one already renamed to a collision-free alias.
+    if(S.pendingFiles.some(p=>_pendingFileOrigName(p)===f.name&&p.size===f.size&&p.lastModified===f.lastModified))continue;
+    if(S.pendingFiles.some(p=>p.name===f.name)){
+      const copy=new File([f],_pendingFileUniqueName(f.name),{type:f.type,lastModified:f.lastModified});
+      try{Object.defineProperty(copy,'_origName',{value:f.name});}catch(_){}
+      S.pendingFiles.push(copy);
+      continue;
+    }
+    S.pendingFiles.push(f);
   }
   renderTray();
 }
