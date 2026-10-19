@@ -6342,7 +6342,7 @@ def _get_or_materialize_session(sid: str, *, refresh_cli_messages: bool = False)
             title=cli_meta.get("title") or title_from(get_cli_session_messages(sid), "CLI Session"),
             workspace=get_last_workspace(),
             model=cli_meta.get("model") or "unknown",
-            model_provider=cli_meta.get("model_provider"),
+            model_provider=_routable_imported_model_provider(cli_meta.get("model_provider"), cli_meta.get("profile")),
             created_at=cli_meta.get("created_at"),
             updated_at=cli_meta.get("updated_at"),
         )
@@ -6361,7 +6361,7 @@ def _get_or_materialize_session(sid: str, *, refresh_cli_messages: bool = False)
             profile=cli_meta.get("profile"),
             created_at=cli_meta.get("created_at"),
             updated_at=cli_meta.get("updated_at"),
-            model_provider=cli_meta.get("model_provider"),
+            model_provider=_routable_imported_model_provider(cli_meta.get("model_provider"), cli_meta.get("profile")),
         )
         _apply_source_meta(s)
 
@@ -6474,7 +6474,10 @@ def _build_share_metadata_sidecar(
         messages=[],
         model=cli_meta.get("model") or getattr(snapshot_session, "model", None) or "unknown",
         model_provider=(
-            cli_meta.get("model_provider")
+            _routable_imported_model_provider(
+                cli_meta.get("model_provider"),
+                cli_meta.get("profile") or getattr(snapshot_session, "profile", None),
+            )
             or getattr(snapshot_session, "model_provider", None)
         ),
         created_at=cli_meta.get("created_at") or getattr(snapshot_session, "created_at", None),
@@ -7785,6 +7788,79 @@ def _clean_session_model_provider(value: str | None) -> str | None:
         parsed = _parse_provider_qualified_model_id(provider)
         provider = parsed[1].strip() if parsed else provider[1:]
     return provider or None
+
+
+def _routable_imported_model_provider(value: str | None, profile: str | None = None) -> str | None:
+    """Return a Desktop/CLI session's provider only when its profile can route it.
+
+    Import copies the provider state.db recorded (#8249). That provider may be
+    one the owning profile no longer has: a ``custom:*`` relay removed from
+    config.yaml, or a built-in with no login or key. Pinning it would fail the
+    first send, where an unpinned session falls back to the profile provider.
+    So keep it only when the owning profile can route it, and return None
+    otherwise, including when that cannot be confirmed.
+    """
+    pid = _clean_session_model_provider(value)
+    if not pid:
+        return None
+    profile_name = str(profile or "").strip()
+    try:
+        from api.profiles import (
+            get_active_profile_name,
+            get_hermes_home_for_profile,
+            profile_scope_for_detached_worker,
+        )
+
+        cfg = (
+            api_config.get_config_for_profile_home(get_hermes_home_for_profile(profile_name))
+            if profile_name
+            else get_config()
+        ) or {}
+        model_cfg = cfg.get("model") if isinstance(cfg.get("model"), dict) else {}
+        if str(model_cfg.get("provider") or "").strip().lower() == pid:
+            return pid
+        if pid.startswith("custom:"):
+            # Same ownership rule the send path uses for a named custom route.
+            record, _source, _exact, _status = api_config._select_custom_provider_record(
+                pid, api_config._custom_provider_slug_key(pid), cfg
+            )
+            return pid if record is not None else None
+        if pid == "custom":
+            # A bare `custom` is the profile's own endpoint. Any other profile
+            # resolves it to an ambient fallback, not the Desktop route.
+            return None
+        providers_cfg = cfg.get("providers")
+        if isinstance(providers_cfg, dict) and isinstance(providers_cfg.get(pid), dict):
+            if providers_cfg[pid].get("enabled", True) is not False:
+                return pid
+
+        from api.oauth import resolve_runtime_provider_with_anthropic_env_lock
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+        try:
+            from hermes_cli.runtime_provider import deferred_token_mint
+        except ImportError:
+            from contextlib import nullcontext as deferred_token_mint
+
+        def _resolve():
+            with deferred_token_mint():
+                return resolve_runtime_provider_with_anthropic_env_lock(
+                    resolve_runtime_provider,
+                    requested=pid,
+                )
+
+        if profile_name and not _profiles_match(profile_name, get_active_profile_name()):
+            with profile_scope_for_detached_worker(
+                profile_name,
+                "imported provider check",
+                logger_override=logger,
+            ):
+                runtime = _resolve()
+        else:
+            runtime = _resolve()
+        return pid if isinstance(runtime, dict) and runtime.get("api_key") else None
+    except Exception:
+        logger.debug("imported provider %r is not routable for profile %r", pid, profile_name, exc_info=True)
+        return None
 
 
 def _split_provider_qualified_model(model: str) -> tuple[str, str | None]:
@@ -9808,7 +9884,15 @@ def _claim_or_synthesize_cli_session(sid: str, cli_meta: dict = None):
             title=(cli_meta or {}).get("title") or "CLI Session",
             workspace=build_workspace(sid, cli_meta),
             model=(cli_meta or {}).get("model") or "unknown",
-            model_provider=(cli_meta or {}).get("model_provider"),
+            # A read-only stub never sends, so it needs no provider check.
+            model_provider=(
+                None
+                if read_only_flag
+                else _routable_imported_model_provider(
+                    (cli_meta or {}).get("model_provider"),
+                    (cli_meta or {}).get("profile"),
+                )
+            ),
             messages=msgs,
             created_at=(cli_meta or {}).get("created_at") or 0,
             updated_at=(cli_meta or {}).get("updated_at") or 0,
@@ -19929,7 +20013,7 @@ def handle_post(handler, parsed) -> bool:
                     workspace=get_last_workspace(profile=_arch_profile),
                     messages=[],
                     model=cli_meta.get("model") or "unknown",
-                    model_provider=cli_meta.get("model_provider"),
+                    model_provider=_routable_imported_model_provider(cli_meta.get("model_provider"), cli_meta.get("profile")),
                     created_at=cli_meta.get("created_at"),
                     updated_at=cli_meta.get("updated_at"),
                     profile=_arch_profile,
@@ -19958,7 +20042,7 @@ def handle_post(handler, parsed) -> bool:
                     profile=cli_meta.get("profile"),
                     created_at=cli_meta.get("created_at"),
                     updated_at=cli_meta.get("updated_at"),
-                    model_provider=cli_meta.get("model_provider"),
+                    model_provider=_routable_imported_model_provider(cli_meta.get("model_provider"), cli_meta.get("profile")),
                 )
                 s.is_cli_session = is_cli_session_row(cli_meta)
                 s.source_tag = cli_meta.get("source_tag")
@@ -33041,6 +33125,17 @@ def _handle_session_import_cli(handler, body):
             sid,
             profile=(cli_meta or {}).get("profile") or refresh_profile,
         )
+        # Decide routability before taking the session lock: it reads only
+        # profile config and credentials, never the session. A provider the
+        # owning profile cannot route is not backfilled.
+        routable_cli_provider = (
+            _routable_imported_model_provider(
+                cli_meta.get("model_provider"),
+                cli_meta.get("profile") or refresh_profile,
+            )
+            if cli_meta
+            else None
+        )
         # Reload under the session lock before repair. The pre-lock load is
         # stale if a model pick lands in between, and saving that object
         # writes the old model/provider pair back over the pick.
@@ -33085,7 +33180,7 @@ def _handle_session_import_cli(handler, body):
                     getattr(current, "model", None),
                     _clean_session_model_provider(getattr(current, "model_provider", None)),
                     cli_meta.get("model"),
-                    _clean_session_model_provider(cli_meta.get("model_provider")),
+                    routable_cli_provider,
                 )
                 if filled_provider:
                     updates["model_provider"] = filled_provider
@@ -33111,17 +33206,24 @@ def _handle_session_import_cli(handler, body):
                 )
             # Session.load returns a new object. An already-open session stays
             # in SESSIONS, and a later draft save of that object would wipe a
-            # disk-only repair. Copy the provider onto the resident object.
+            # disk-only repair. Copy the provider onto the resident object, but
+            # only the Desktop provider this request confirmed routable.
             from api.agent_sessions import model_provider_backfill
             from api.config import LOCK, SESSIONS
             with LOCK:
                 resident = SESSIONS.get(sid)
-            if resident is not None and resident is not current:
+            current_provider = _clean_session_model_provider(getattr(current, "model_provider", None))
+            if (
+                resident is not None
+                and resident is not current
+                and routable_cli_provider
+                and current_provider == routable_cli_provider
+            ):
                 resident_provider = model_provider_backfill(
                     getattr(resident, "model", None),
                     _clean_session_model_provider(getattr(resident, "model_provider", None)),
                     cli_meta.get("model") if cli_meta else getattr(current, "model", None),
-                    getattr(current, "model_provider", None),
+                    routable_cli_provider,
                 )
                 if resident_provider:
                     resident.model_provider = resident_provider
@@ -33244,7 +33346,10 @@ def _handle_session_import_cli(handler, body):
         created_at=created_at,
         updated_at=updated_at,
         parent_session_id=cli_parent_session_id,
-        model_provider=(cli_meta or {}).get("model_provider"),
+        model_provider=_routable_imported_model_provider(
+            (cli_meta or {}).get("model_provider"),
+            profile,
+        ),
     )
     if cron_project_id:
         s.project_id = cron_project_id

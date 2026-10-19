@@ -109,6 +109,27 @@ matches the imported model. A provider already set on the sidecar is not
 overwritten, and a later model change does not inherit the old Desktop
 provider.
 
+Every import, materialize, archive, claim and re-import site saves that
+provider only when the owning profile (`cli_meta["profile"]`) can route it
+(`_routable_imported_model_provider`). Otherwise the sidecar keeps no provider
+and the first send uses the profile provider, as before #8249, instead of
+failing on a route the profile no longer has. The check is:
+
+- the profile's own `model.provider`: kept;
+- `custom:<slug>`: kept only when a record in that profile's config owns the
+  slug, by the same selection the send path uses
+  (`_select_custom_provider_record`). A relay removed from `config.yaml` is
+  dropped;
+- bare `custom`: kept only when it is the profile's own provider;
+- a built-in with an enabled `providers:` entry: kept;
+- any other built-in: kept only when the Agent's `resolve_runtime_provider`
+  returns a credential for it under that profile. A missing login or key,
+  or a resolver that cannot be loaded, drops it.
+
+The list projection itself is not checked, because it is cached and built for
+every sidebar row. The check runs where the provider is written, so a config
+edit after the list was cached still applies.
+
 ## Tests
 
 - `tests/test_7860_model_provider_send_precedence.py` — drives the real
