@@ -263,6 +263,7 @@ def test_claim_row_survives_a_db_without_provider_columns(tmp_path):
 
 import io
 import sys
+import os
 import types
 
 import pytest
@@ -280,12 +281,14 @@ custom_providers:
     base_url: http://127.0.0.1:18999/v1
     api_key: sk-relay-b
 providers:
-  keyed-builtin:
-    api_key: sk-keyed
-  disabled-builtin:
-    api_key: sk-disabled
-    enabled: false
+  deepseek: {}
+  endpoint-builtin:
+    base_url: http://127.0.0.1:18777/v1
+  unresolved-builtin:
+    api_key: ${HERMES_8249_UNSET_KEY}
 """
+# Env names the stub resolver treats as credentials (see ``stub_resolver``).
+_GATE_KEY_ENVS = ("OPENROUTER_API_KEY", "XAI_API_KEY", "DEEPSEEK_API_KEY", "HERMES_8249_UNSET_KEY")
 
 
 @pytest.fixture
@@ -296,6 +299,10 @@ def gate_profile(tmp_path, monkeypatch):
     home = tmp_path / "profile-home"
     home.mkdir()
     (home / "config.yaml").write_text(_GATE_CONFIG, encoding="utf-8")
+    # The only credential is in this profile's own .env, not the process env.
+    (home / ".env").write_text("OPENROUTER_API_KEY=sk-or-gate-test\n", encoding="utf-8")
+    for name in _GATE_KEY_ENVS:
+        monkeypatch.delenv(name, raising=False)
     real = profiles.get_hermes_home_for_profile
     monkeypatch.setattr(
         profiles,
@@ -307,13 +314,19 @@ def gate_profile(tmp_path, monkeypatch):
 
 @pytest.fixture
 def stub_resolver(monkeypatch):
-    """Stand-in for the Agent resolver: only ``openrouter`` has a credential."""
+    """Stand-in for the Agent resolver.
+
+    Like the real one, it finds a credential only when ``<PID>_API_KEY`` is in
+    the environment it runs in, so a key that lives only in the profile .env is
+    found only inside that profile's scope.
+    """
     calls = []
 
     def resolve_runtime_provider(*, requested=None, **_kwargs):
         calls.append(requested)
-        if requested == "openrouter":
-            return {"provider": "openrouter", "api_key": "sk-or", "base_url": "https://openrouter.ai/api/v1"}
+        key = os.environ.get(f"{str(requested).upper().replace('-', '_')}_API_KEY")
+        if key:
+            return {"provider": requested, "api_key": key, "base_url": "https://example.invalid/v1"}
         raise RuntimeError(f"No usable credentials found for provider {requested!r}")
 
     module = types.ModuleType("hermes_cli.runtime_provider")
@@ -333,16 +346,36 @@ def test_gate_keeps_only_providers_the_owning_profile_can_route(gate_profile, st
     # A bare `custom` names the profile's own endpoint. This profile is on a
     # named relay, so the Agent would resolve it to an ambient fallback.
     assert gate("custom", _GATE_PROFILE) is None
-    # Built-ins: a providers: entry, or a credential from the Agent resolver.
-    assert gate("keyed-builtin", _GATE_PROFILE) == "keyed-builtin"
+    # Built-ins: only a credential from the Agent resolver, found in the
+    # profile's .env, counts.
     assert gate("openrouter", _GATE_PROFILE) == "openrouter"
     assert gate("xai-oauth", _GATE_PROFILE) is None
-    # A disabled providers: entry is not a route; the resolver decides.
-    assert gate("disabled-builtin", _GATE_PROFILE) is None
+    # A providers: entry is not a credential: empty, endpoint-only, or an
+    # unresolved ${VAR} key.
+    assert gate("deepseek", _GATE_PROFILE) is None
+    assert gate("endpoint-builtin", _GATE_PROFILE) is None
+    assert gate("unresolved-builtin", _GATE_PROFILE) is None
     assert gate(None, _GATE_PROFILE) is None
     assert gate("default", _GATE_PROFILE) is None
-    # Config answered every custom and providers: case without the resolver.
-    assert stub_resolver == ["openrouter", "xai-oauth", "disabled-builtin"]
+    # Config answered the custom cases; every built-in went to the resolver.
+    assert stub_resolver == ["openrouter", "xai-oauth", "deepseek", "endpoint-builtin", "unresolved-builtin"]
+
+
+def test_gate_binds_the_owner_scope_when_it_is_already_the_request_profile(gate_profile, stub_resolver):
+    from api.profiles import clear_request_profile, set_request_profile
+    from api.routes import _routable_imported_model_provider as gate
+
+    # A normal named-profile request: TLS already names the owner, but that
+    # does not apply the owner's .env, where the only key lives.
+    set_request_profile(_GATE_PROFILE)
+    try:
+        assert gate("openrouter", _GATE_PROFILE) == "openrouter"
+        # A row without a recorded profile is owned by the request profile.
+        assert gate("openrouter", None) == "openrouter"
+        assert gate("xai-oauth", _GATE_PROFILE) is None
+    finally:
+        clear_request_profile()
+    assert "OPENROUTER_API_KEY" not in os.environ
 
 
 def test_gate_fails_closed_when_the_resolver_is_unavailable(gate_profile, monkeypatch):
@@ -366,15 +399,20 @@ def _installed_agent_resolver():
 def test_gate_uses_the_installed_agent_resolver(gate_profile, monkeypatch):
     from api.routes import _routable_imported_model_provider as gate
 
-    for name in ("OPENROUTER_API_KEY", "XAI_API_KEY", "DEEPSEEK_API_KEY"):
-        monkeypatch.delenv(name, raising=False)
-    (gate_profile / ".env").write_text("OPENROUTER_API_KEY=sk-or-gate-test\n", encoding="utf-8")
+    from api.profiles import clear_request_profile, set_request_profile
 
     assert gate("openrouter", _GATE_PROFILE) == "openrouter"
-    # No xAI login and no DeepSeek key in this profile.
+    # No xAI login, and `deepseek: {}` in providers: is not a DeepSeek key.
     assert gate("xai-oauth", _GATE_PROFILE) is None
     assert gate("deepseek", _GATE_PROFILE) is None
     assert gate("custom:removed-relay", _GATE_PROFILE) is None
+    # Same answer when the owner is already the request profile.
+    set_request_profile(_GATE_PROFILE)
+    try:
+        assert gate("openrouter", _GATE_PROFILE) == "openrouter"
+        assert gate("deepseek", _GATE_PROFILE) is None
+    finally:
+        clear_request_profile()
 
 
 class _ImportHandler:
@@ -495,3 +533,38 @@ def test_saved_link_claim_pins_only_a_routable_provider(gate_profile, stub_resol
     assert reason == "materialized"
     assert session.model == "grok-4.7"
     assert session.model_provider == expected
+
+
+@pytest.mark.parametrize("desktop_provider", ["deepseek", "endpoint-builtin", "unresolved-builtin"])
+def test_providers_entry_without_a_key_falls_back_to_the_profile_route(
+    gate_profile, stub_resolver, monkeypatch, desktop_provider
+):
+    import api.config as api_config
+    import api.routes as routes
+    from api.models import SESSION_DIR, Session
+
+    sid = "import_gate_providers_8249"
+    (SESSION_DIR / f"{sid}.json").unlink(missing_ok=True)
+    captured = _stub_cli_store(monkeypatch, routes, desktop_provider)
+    try:
+        routes._handle_session_import_cli(_ImportHandler(), {"session_id": sid})
+        assert "error" not in captured, captured
+        loaded = Session.load(sid)
+        assert loaded.model_provider is None
+
+        # The first send resolves the session's model the way the chat
+        # handler does, against the owning profile's config.
+        monkeypatch.setenv("HERMES_CONFIG_PATH", str(gate_profile / "config.yaml"))
+        api_config.reload_config()
+        _model, provider, _base_url = api_config.resolve_model_provider(
+            api_config.model_with_provider_context(loaded.model, loaded.model_provider)
+        )
+        assert provider == "custom:available"
+        assert api_config.resolve_custom_provider_connection(provider) == (
+            "sk-available",
+            "http://127.0.0.1:18888/v1",
+        )
+    finally:
+        (SESSION_DIR / f"{sid}.json").unlink(missing_ok=True)
+        monkeypatch.delenv("HERMES_CONFIG_PATH", raising=False)
+        api_config.reload_config()

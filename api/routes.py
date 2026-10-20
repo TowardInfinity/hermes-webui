@@ -7811,6 +7811,7 @@ def _routable_imported_model_provider(value: str | None, profile: str | None = N
             profile_scope_for_detached_worker,
         )
 
+        profile_name = profile_name or str(get_active_profile_name() or "").strip()
         cfg = (
             api_config.get_config_for_profile_home(get_hermes_home_for_profile(profile_name))
             if profile_name
@@ -7829,11 +7830,9 @@ def _routable_imported_model_provider(value: str | None, profile: str | None = N
             # A bare `custom` is the profile's own endpoint. Any other profile
             # resolves it to an ambient fallback, not the Desktop route.
             return None
-        providers_cfg = cfg.get("providers")
-        if isinstance(providers_cfg, dict) and isinstance(providers_cfg.get(pid), dict):
-            if providers_cfg[pid].get("enabled", True) is not False:
-                return pid
-
+        # A `providers:` entry is not proof of a credential (`deepseek: {}`,
+        # an endpoint-only entry, an unresolved `${VAR}` key), so built-ins
+        # always go through the Agent resolver.
         from api.oauth import resolve_runtime_provider_with_anthropic_env_lock
         from hermes_cli.runtime_provider import resolve_runtime_provider
         try:
@@ -7848,14 +7847,13 @@ def _routable_imported_model_provider(value: str | None, profile: str | None = N
                     requested=pid,
                 )
 
-        if profile_name and not _profiles_match(profile_name, get_active_profile_name()):
-            with profile_scope_for_detached_worker(
-                profile_name,
-                "imported provider check",
-                logger_override=logger,
-            ):
-                runtime = _resolve()
-        else:
+        # Request-profile TLS alone does not apply a named profile's `.env`,
+        # so bind the owner's scope even when it is already the active profile.
+        with profile_scope_for_detached_worker(
+            profile_name,
+            "imported provider check",
+            logger_override=logger,
+        ):
             runtime = _resolve()
         return pid if isinstance(runtime, dict) and runtime.get("api_key") else None
     except Exception:

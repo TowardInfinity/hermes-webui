@@ -121,10 +121,16 @@ failing on a route the profile no longer has. The check is:
   (`_select_custom_provider_record`). A relay removed from `config.yaml` is
   dropped;
 - bare `custom`: kept only when it is the profile's own provider;
-- a built-in with an enabled `providers:` entry: kept;
-- any other built-in: kept only when the Agent's `resolve_runtime_provider`
-  returns a credential for it under that profile. A missing login or key,
-  or a resolver that cannot be loaded, drops it.
+- any built-in: kept only when the Agent's `resolve_runtime_provider`
+  returns a credential for it under that profile. A `providers:` entry is not
+  enough on its own: an empty entry, an endpoint-only entry or an unresolved
+  `${VAR}` key gives the send path no credential. A missing login or key, or a
+  resolver that cannot be loaded, drops it.
+
+The resolver runs inside `profile_scope_for_detached_worker` for the owning
+profile (the request profile when the row names none), including when that
+profile is already the request profile. Request-profile TLS alone does not
+apply a named profile's `.env`, where its keys usually live.
 
 The list projection itself is not checked, because it is cached and built for
 every sidebar row. The check runs where the provider is written, so a config
