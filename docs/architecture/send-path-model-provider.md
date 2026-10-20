@@ -99,6 +99,14 @@ send path runs. Lookup order is `model_config.gateway_runtime.provider`, then
 provider. `auto` and `custom` are billing buckets, not identities, and stay
 unset so chat start still uses the profile provider.
 
+An effective `gateway_runtime` route ends the lookup, as it does in the Agent
+(`hermes_state_gateway`): a named route is the answer, and a bare `custom`,
+`auto` or `default` route leaves the provider unset. The older
+`model_config.provider` and `billing_provider` were replaced by that route, so
+falling through to them would pin a provider the session no longer uses. The
+projection has no profile, so it cannot map the runtime's endpoint to a named
+identity; leaving it unset gives the profile-provider behavior of master.
+
 The recent-session list publishes that value as `model_provider`. A saved
 link to an older session is not in that capped list. The single-row claim
 path (`_claim_or_synthesize_cli_session`) reads the same columns, so that
@@ -117,9 +125,14 @@ failing on a route the profile no longer has. The check is:
 
 - the profile's own `model.provider`: kept;
 - `custom:<slug>`: kept only when a record in that profile's config owns the
-  slug, by the same selection the send path uses
-  (`_select_custom_provider_record`). A relay removed from `config.yaml` is
-  dropped;
+  slug (`_select_custom_provider_record`) **and** the send path's own verdict
+  accepts it: the runtime lookup followed by
+  `merge_custom_provider_runtime_bundle`, with no route error. A relay removed
+  from `config.yaml`, a record with a key but no endpoint
+  (`custom_provider_endpoint_unresolved`), and one whose declared `key_env` does
+  not resolve (`custom_provider_credential_unresolved`) are dropped. Keyless
+  endpoints and keys from the profile `.env`, a pool or a `key_cmd` stay
+  routable;
 - bare `custom`: kept only when it is the profile's own provider;
 - any built-in: kept only when the Agent's `resolve_runtime_provider`
   returns a credential for it under that profile. A `providers:` entry is not
@@ -127,7 +140,7 @@ failing on a route the profile no longer has. The check is:
   `${VAR}` key gives the send path no credential. A missing login or key, or a
   resolver that cannot be loaded, drops it.
 
-The resolver runs inside `profile_scope_for_detached_worker` for the owning
+The runtime lookup runs inside `profile_scope_for_detached_worker` for the owning
 profile (the request profile when the row names none), including when that
 profile is already the request profile. Request-profile TLS alone does not
 apply a named profile's `.env`, where its keys usually live.

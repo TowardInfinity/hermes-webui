@@ -7795,10 +7795,11 @@ def _routable_imported_model_provider(value: str | None, profile: str | None = N
 
     Import copies the provider state.db recorded (#8249). That provider may be
     one the owning profile no longer has: a ``custom:*`` relay removed from
-    config.yaml, or a built-in with no login or key. Pinning it would fail the
-    first send, where an unpinned session falls back to the profile provider.
-    So keep it only when the owning profile can route it, and return None
-    otherwise, including when that cannot be confirmed.
+    config.yaml or left without a usable endpoint or key, or a built-in with no
+    login or key. Pinning it would fail the first send, where an unpinned
+    session falls back to the profile provider. So keep it only when the owning
+    profile can route it, and return None otherwise, including when that cannot
+    be confirmed.
     """
     pid = _clean_session_model_provider(value)
     if not pid:
@@ -7820,19 +7821,18 @@ def _routable_imported_model_provider(value: str | None, profile: str | None = N
         model_cfg = cfg.get("model") if isinstance(cfg.get("model"), dict) else {}
         if str(model_cfg.get("provider") or "").strip().lower() == pid:
             return pid
+        if pid == "custom":
+            # A bare `custom` is the profile's own endpoint. Any other profile
+            # resolves it to an ambient fallback, not the Desktop route.
+            return None
         if pid.startswith("custom:"):
             # Same ownership rule the send path uses for a named custom route.
             record, _source, _exact, _status = api_config._select_custom_provider_record(
                 pid, api_config._custom_provider_slug_key(pid), cfg
             )
-            return pid if record is not None else None
-        if pid == "custom":
-            # A bare `custom` is the profile's own endpoint. Any other profile
-            # resolves it to an ambient fallback, not the Desktop route.
-            return None
-        # A `providers:` entry is not proof of a credential (`deepseek: {}`,
-        # an endpoint-only entry, an unresolved `${VAR}` key), so built-ins
-        # always go through the Agent resolver.
+            if record is None:
+                return None
+
         from api.oauth import resolve_runtime_provider_with_anthropic_env_lock
         from hermes_cli.runtime_provider import resolve_runtime_provider
         try:
@@ -7854,7 +7854,30 @@ def _routable_imported_model_provider(value: str | None, profile: str | None = N
             "imported provider check",
             logger_override=logger,
         ):
+            if pid.startswith("custom:"):
+                # A record is not a route: it can lack an endpoint or carry an
+                # unresolved key. Ask the verdict the send path itself applies
+                # (the same runtime lookup, then the same bundle merge), so
+                # keyless, pool, key_cmd and ACP records stay routable and an
+                # unusable one is left unpinned.
+                try:
+                    runtime = _resolve()
+                except Exception:
+                    runtime = None
+                runtime = runtime if isinstance(runtime, dict) else None
+                bundle = api_config.merge_custom_provider_runtime_bundle(
+                    pid,
+                    (runtime or {}).get("api_key"),
+                    (runtime or {}).get("base_url"),
+                    runtime,
+                    lookup_provider=pid,
+                    connection_resolver=api_config.resolve_custom_provider_connection,
+                )
+                return pid if api_config.custom_provider_route_error(bundle) is None else None
             runtime = _resolve()
+        # A `providers:` entry is not proof of a credential (`deepseek: {}`,
+        # an endpoint-only entry, an unresolved `${VAR}` key), so built-ins
+        # always go through the Agent resolver.
         return pid if isinstance(runtime, dict) and runtime.get("api_key") else None
     except Exception:
         logger.debug("imported provider %r is not routable for profile %r", pid, profile_name, exc_info=True)

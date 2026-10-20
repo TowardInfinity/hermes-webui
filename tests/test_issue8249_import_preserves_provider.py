@@ -264,7 +264,9 @@ def test_claim_row_survives_a_db_without_provider_columns(tmp_path):
 import io
 import sys
 import os
+import shutil
 import types
+from pathlib import Path
 
 import pytest
 
@@ -280,6 +282,16 @@ custom_providers:
   - name: relay-b
     base_url: http://127.0.0.1:18999/v1
     api_key: sk-relay-b
+  - name: no-endpoint-relay
+    api_key: sk-no-endpoint
+  - name: unset-key-relay
+    base_url: http://127.0.0.1:18666/v1
+    key_env: HERMES_8249_UNSET_KEY
+  - name: keyless-relay
+    base_url: http://127.0.0.1:18555/v1
+  - name: env-key-relay
+    base_url: http://127.0.0.1:18444/v1
+    key_env: HERMES_8249_RELAY_KEY
 providers:
   deepseek: {}
   endpoint-builtin:
@@ -288,28 +300,39 @@ providers:
     api_key: ${HERMES_8249_UNSET_KEY}
 """
 # Env names the stub resolver treats as credentials (see ``stub_resolver``).
-_GATE_KEY_ENVS = ("OPENROUTER_API_KEY", "XAI_API_KEY", "DEEPSEEK_API_KEY", "HERMES_8249_UNSET_KEY")
+_GATE_KEY_ENVS = (
+    "OPENROUTER_API_KEY",
+    "XAI_API_KEY",
+    "DEEPSEEK_API_KEY",
+    "HERMES_8249_UNSET_KEY",
+    "HERMES_8249_RELAY_KEY",
+)
 
 
 @pytest.fixture
-def gate_profile(tmp_path, monkeypatch):
-    """A named profile whose home holds only ``_GATE_CONFIG``."""
+def gate_profile(monkeypatch):
+    """A named profile whose real home holds only ``_GATE_CONFIG``."""
+    import api.config as api_config
     import api.profiles as profiles
 
-    home = tmp_path / "profile-home"
-    home.mkdir()
+    home = Path(profiles.get_hermes_home_for_profile(_GATE_PROFILE))
+    assert home.name == _GATE_PROFILE, home
+    shutil.rmtree(home, ignore_errors=True)
+    home.mkdir(parents=True)
     (home / "config.yaml").write_text(_GATE_CONFIG, encoding="utf-8")
     # The only credential is in this profile's own .env, not the process env.
-    (home / ".env").write_text("OPENROUTER_API_KEY=sk-or-gate-test\n", encoding="utf-8")
+    (home / ".env").write_text(
+        "OPENROUTER_API_KEY=sk-or-gate-test\nHERMES_8249_RELAY_KEY=sk-env-relay\n", encoding="utf-8"
+    )
     for name in _GATE_KEY_ENVS:
         monkeypatch.delenv(name, raising=False)
-    real = profiles.get_hermes_home_for_profile
-    monkeypatch.setattr(
-        profiles,
-        "get_hermes_home_for_profile",
-        lambda name: home if name == _GATE_PROFILE else real(name),
-    )
-    return home
+    # The test environment pins one shared config file; production resolves the
+    # config from the active profile's home, which is what the gate must read.
+    monkeypatch.delenv("HERMES_CONFIG_PATH", raising=False)
+    api_config.reload_config()
+    yield home
+    shutil.rmtree(home, ignore_errors=True)
+    api_config.reload_config()
 
 
 @pytest.fixture
@@ -341,6 +364,14 @@ def test_gate_keeps_only_providers_the_owning_profile_can_route(gate_profile, st
     # Named custom relays: kept only when this profile's config owns them.
     assert gate("custom:relay-b", _GATE_PROFILE) == "custom:relay-b"
     assert gate("custom:removed-relay", _GATE_PROFILE) is None
+    # A record is not a route. The send path refuses a relay with a key but no
+    # endpoint, or with a declared key_env that does not resolve, while an
+    # unpinned session reaches the profile's working relay.
+    assert gate("custom:no-endpoint-relay", _GATE_PROFILE) is None
+    assert gate("custom:unset-key-relay", _GATE_PROFILE) is None
+    # Keyless endpoints and a key_env that resolves from the profile .env work.
+    assert gate("custom:keyless-relay", _GATE_PROFILE) == "custom:keyless-relay"
+    assert gate("custom:env-key-relay", _GATE_PROFILE) == "custom:env-key-relay"
     # The profile's own provider is routed the same way an unpinned session is.
     assert gate("custom:available", _GATE_PROFILE) == "custom:available"
     # A bare `custom` names the profile's own endpoint. This profile is on a
@@ -357,8 +388,20 @@ def test_gate_keeps_only_providers_the_owning_profile_can_route(gate_profile, st
     assert gate("unresolved-builtin", _GATE_PROFILE) is None
     assert gate(None, _GATE_PROFILE) is None
     assert gate("default", _GATE_PROFILE) is None
-    # Config answered the custom cases; every built-in went to the resolver.
-    assert stub_resolver == ["openrouter", "xai-oauth", "deepseek", "endpoint-builtin", "unresolved-builtin"]
+    # The unowned relay and the profile's own provider never reach the
+    # resolver; an owned relay and every built-in do.
+    assert stub_resolver == [
+        "custom:relay-b",
+        "custom:no-endpoint-relay",
+        "custom:unset-key-relay",
+        "custom:keyless-relay",
+        "custom:env-key-relay",
+        "openrouter",
+        "xai-oauth",
+        "deepseek",
+        "endpoint-builtin",
+        "unresolved-builtin",
+    ]
 
 
 def test_gate_binds_the_owner_scope_when_it_is_already_the_request_profile(gate_profile, stub_resolver):
@@ -383,8 +426,10 @@ def test_gate_fails_closed_when_the_resolver_is_unavailable(gate_profile, monkey
 
     monkeypatch.setitem(sys.modules, "hermes_cli.runtime_provider", None)
     assert gate("openrouter", _GATE_PROFILE) is None
-    # Config-only answers do not need the Agent.
-    assert gate("custom:relay-b", _GATE_PROFILE) == "custom:relay-b"
+    assert gate("custom:relay-b", _GATE_PROFILE) is None
+    # Answers that never needed the Agent are unchanged.
+    assert gate("custom:available", _GATE_PROFILE) == "custom:available"
+    assert gate("custom:removed-relay", _GATE_PROFILE) is None
 
 
 def _installed_agent_resolver():
@@ -406,6 +451,11 @@ def test_gate_uses_the_installed_agent_resolver(gate_profile, monkeypatch):
     assert gate("xai-oauth", _GATE_PROFILE) is None
     assert gate("deepseek", _GATE_PROFILE) is None
     assert gate("custom:removed-relay", _GATE_PROFILE) is None
+    assert gate("custom:relay-b", _GATE_PROFILE) == "custom:relay-b"
+    assert gate("custom:keyless-relay", _GATE_PROFILE) == "custom:keyless-relay"
+    assert gate("custom:env-key-relay", _GATE_PROFILE) == "custom:env-key-relay"
+    assert gate("custom:no-endpoint-relay", _GATE_PROFILE) is None
+    assert gate("custom:unset-key-relay", _GATE_PROFILE) is None
     # Same answer when the owner is already the request profile.
     set_request_profile(_GATE_PROFILE)
     try:
@@ -554,17 +604,97 @@ def test_providers_entry_without_a_key_falls_back_to_the_profile_route(
 
         # The first send resolves the session's model the way the chat
         # handler does, against the owning profile's config.
-        monkeypatch.setenv("HERMES_CONFIG_PATH", str(gate_profile / "config.yaml"))
-        api_config.reload_config()
-        _model, provider, _base_url = api_config.resolve_model_provider(
-            api_config.model_with_provider_context(loaded.model, loaded.model_provider)
-        )
-        assert provider == "custom:available"
-        assert api_config.resolve_custom_provider_connection(provider) == (
-            "sk-available",
-            "http://127.0.0.1:18888/v1",
-        )
+        from api.profiles import profile_scope_for_detached_worker
+
+        with profile_scope_for_detached_worker(_GATE_PROFILE, "test first send"):
+            api_config.reload_config()
+            _model, provider, _base_url = api_config.resolve_model_provider(
+                api_config.model_with_provider_context(loaded.model, loaded.model_provider)
+            )
+            assert provider == "custom:available"
+            assert api_config.resolve_custom_provider_connection(provider) == (
+                "sk-available",
+                "http://127.0.0.1:18888/v1",
+            )
     finally:
         (SESSION_DIR / f"{sid}.json").unlink(missing_ok=True)
-        monkeypatch.delenv("HERMES_CONFIG_PATH", raising=False)
+
+
+def test_effective_runtime_route_is_never_replaced_by_an_older_provider():
+    """The Agent reads ``gateway_runtime`` first and stops there."""
+    stale = {"provider": "custom:relay-a", "base_url": "http://relay-a/v1"}
+
+    def row(runtime, billing="custom:relay-a"):
+        return {
+            "model_config": json.dumps({**stale, "gateway_runtime": runtime}),
+            "billing_provider": billing,
+        }
+
+    # A bare `custom` runtime names an endpoint, not a provider. The older
+    # selected and billing providers were replaced by it, so nothing is pinned.
+    assert _model_provider_from_agent_row(
+        row({"provider": "custom", "base_url": "http://relay-b/v1"})
+    ) is None
+    assert _model_provider_from_agent_row(row({"provider": "auto"})) is None
+    assert _model_provider_from_agent_row(row({"provider": "default"})) is None
+    # A named runtime still wins over the older sources.
+    assert _model_provider_from_agent_row(
+        row({"provider": "custom:relay-b", "base_url": "http://relay-b/v1"})
+    ) == "custom:relay-b"
+    # Without a runtime route the older sources still apply.
+    assert _model_provider_from_agent_row(row({})) == "custom:relay-a"
+    assert _model_provider_from_agent_row(row({"provider": None, "base_url": None})) == "custom:relay-a"
+
+
+def test_effective_runtime_route_publishes_no_stale_provider_in_the_list_projection(tmp_path):
+    db = tmp_path / "state.db"
+    _desktop_db(
+        db,
+        model_config=json.dumps({
+            "provider": "custom:relay-a",
+            "gateway_runtime": {"provider": "custom", "base_url": "http://relay-b/v1"},
+        }),
+        billing_provider="custom:relay-a",
+    )
+    rows = read_importable_agent_session_rows(db, limit=10)
+    assert rows, "the Desktop row should be importable"
+    assert all("model_provider" not in r for r in rows), rows
+
+
+@pytest.mark.parametrize("desktop_provider", ["custom:no-endpoint-relay", "custom:unset-key-relay"])
+def test_unusable_named_relay_is_unpinned_and_the_first_send_reaches_the_working_route(
+    gate_profile, stub_resolver, monkeypatch, desktop_provider
+):
+    import api.config as api_config
+    import api.routes as routes
+    from api.models import SESSION_DIR, Session
+    from api.profiles import profile_scope_for_detached_worker
+
+    # Control: pinning this relay is exactly what the send path refuses.
+    with profile_scope_for_detached_worker(_GATE_PROFILE, "test pinned send"):
         api_config.reload_config()
+        with pytest.raises(api_config.CustomProviderRouteError) as refused:
+            routes._resolve_agent_connection_bundle(desktop_provider, None, None, None)
+    assert refused.value.reason in {
+        api_config.CUSTOM_ROUTE_NO_ENDPOINT,
+        api_config.CUSTOM_ROUTE_NO_CREDENTIAL,
+    }
+
+    sid = "import_gate_unusable_relay_8249"
+    (SESSION_DIR / f"{sid}.json").unlink(missing_ok=True)
+    captured = _stub_cli_store(monkeypatch, routes, desktop_provider)
+    try:
+        routes._handle_session_import_cli(_ImportHandler(), {"session_id": sid})
+        assert "error" not in captured, captured
+        loaded = Session.load(sid)
+        assert loaded.model_provider is None
+        with profile_scope_for_detached_worker(_GATE_PROFILE, "test first send"):
+            api_config.reload_config()
+            _model, provider, _base_url = api_config.resolve_model_provider(
+                api_config.model_with_provider_context(loaded.model, loaded.model_provider)
+            )
+            assert provider == "custom:available"
+            bundle = routes._resolve_agent_connection_bundle(provider, None, None, None)
+            assert (bundle["api_key"], bundle["base_url"]) == ("sk-available", "http://127.0.0.1:18888/v1")
+    finally:
+        (SESSION_DIR / f"{sid}.json").unlink(missing_ok=True)

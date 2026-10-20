@@ -208,8 +208,10 @@ def _model_provider_from_agent_row(row: dict) -> str | None:
     ``sessions.model`` is a bare id that can exist on more than one provider.
     ``model_config.provider`` is the session's selected provider. ``billing_provider``
     is the standing billing identity on the session row, not a per-call fallback.
-    Prefer the selected provider. Fall back to billing identity only when config
-    has none. An empty result means the row never recorded a provider.
+    Prefer the effective ``gateway_runtime`` route, then the selected provider.
+    Fall back to billing identity only when config has none. An empty result
+    means the row never recorded a provider, or its effective route cannot be
+    named here.
     """
     raw = row.get("model_config")
     if isinstance(raw, (bytes, bytearray)):
@@ -223,9 +225,17 @@ def _model_provider_from_agent_row(row: dict) -> str | None:
         runtime = raw.get("gateway_runtime")
         if isinstance(runtime, dict):
             runtime_provider = str(runtime.get("provider") or "").strip().lower()
-            # Newest route, unless it is only a billing bucket. A bare
-            # `custom` here is not an endpoint. A named `custom:my-relay` is.
-            if runtime_provider and runtime_provider not in {"auto", "custom", "default"}:
+            if runtime_provider:
+                # The Agent resolves a session's route from `gateway_runtime`
+                # first and stops there (hermes_state_gateway), so once it names
+                # a provider every older source is stale. A named route is the
+                # answer. A bare `custom`/`auto`/`default` is only a bucket: the
+                # real endpoint is the runtime's own `base_url`, which this
+                # profile-less projection cannot map to a named identity. Leave
+                # the provider unset rather than fall through to a top-level or
+                # billing provider that the runtime has since replaced.
+                if runtime_provider in {"auto", "custom", "default"}:
+                    return None
                 return runtime_provider
         provider = str(raw.get("provider") or "").strip().lower()
         if provider and provider != "default":
